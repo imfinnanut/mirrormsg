@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "name": "MirrorMsg Cookie Export",
+  "version": "1.0",
+  "browser_specific_settings": {
+    "gecko": { "id": "cookieexport@mirrormsg" }
+  },
+  "permissions": [
+    "cookies",
+    "nativeMessaging",
+    "geckoViewAddons",
+    "*://*.google.com/*"
+  ],
+  "background": { "scripts": ["background.js"] }
+}

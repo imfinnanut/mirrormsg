@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- Lets MirrorMsg start an activity from the BACKGROUND, which is what
+         "open on phone" from the watch needs. When the Pebble companion fires the
+         notification action while it's backgrounded, Android's background-activity-
+         launch (BAL) restriction blocks the launch unless MirrorMsg itself holds a
+         BAL exemption to convey via the PendingIntent's creator-side grant.
+         "Display over other apps" (SYSTEM_ALERT_WINDOW) is that exemption. It is a
+         SPECIAL permission: declaring it here is not enough — the user must enable
+         it in Settings -> Apps -> Special app access -> Display over other apps
+         (or Settings -> Apps -> MirrorMsg -> Display over other apps). -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- Beeper Content Provider (authority com.beeper.api): read chats/messages
+         and send, via the Beeper Android app. Custom Beeper permissions, granted
+         at runtime like POST_NOTIFICATIONS. -->
+    <uses-permission android:name="com.beeper.android.permission.READ_PERMISSION" />
+    <uses-permission android:name="com.beeper.android.permission.SEND_PERMISSION" />
+
+    <!-- Package visibility (Android 11+): lets us resolve/launch the native
+         messaging apps for deep links ("Open on phone"). ACTION_SENDTO/smsto for
+         the default SMS app (Google Messages), plus explicit packages for the
+         protocol handlers we may target later (WhatsApp, Telegram, Signal). -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.SENDTO" />
+            <data android:scheme="smsto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.APP_MESSAGING" />
+        </intent>
+        <package android:name="com.whatsapp" />
+        <package android:name="org.telegram.messenger" />
+        <package android:name="org.thoughtcrime.securesms" />
+        <package android:name="com.discord" />
+        <!-- Beeper: required under Android 11+ scoped package visibility so the
+             content provider is resolvable — without this the query returns
+             null with no thrown error. Provider authority declared explicitly
+             as a belt-and-suspenders alongside the package entry. -->
+        <package android:name="com.beeper.android" />
+        <provider android:authorities="com.beeper.api" />
+    </queries>
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.MirrorMsgSpike">
+        <activity
+            android:name=".MainActivity"
+            android:launchMode="singleTop"
+            android:configChanges="uiMode"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".LogViewerActivity"
+            android:exported="false" />
+
+        <!-- THROWAWAY milestone-0b WhatsApp pairing test. exported so it can be
+             launched directly over USB:
+               adb shell am start -n com.dano.mirrormsg/.WhatsAppPairActivity
+             Delete this entry (and WhatsAppPairActivity.kt) once native WhatsApp
+             graduates to a real WhatsAppService in the Networks tab. -->
+        <activity
+            android:name=".WhatsAppPairActivity"
+            android:exported="true" />
+
+        <!-- PebbleKit Android 2: receives watch->phone requests (REQ_OPEN etc.) -->
+        <service
+            android:name=".PebbleListenerService"
+            android:exported="true"
+            tools:ignore="ExportedService">
+            <intent-filter>
+                <action android:name="io.rebble.pebblekit2.RECEIVE_DATA_FROM_WATCH" />
+            </intent-filter>
+        </service>
+
+        <!-- Reads Beeper's notifications to capture message images (the only
+             on-device source of image bytes — the content provider exposes
+             images only as unresolvable mxc:// handles). Bound by the system
+             once the user grants Notification Access (Settings → Permissions →
+             "Notification access"). No <uses-permission> needed; access is the
+             Settings-toggle kind, gated here by BIND_NOTIFICATION_LISTENER_SERVICE. -->
+        <service
+            android:name=".BeeperNotificationListenerService"
+            android:label="MirrorMsg notification access"
+            android:exported="false"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- FileProvider for sharing the log file -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+        <receiver
+            android:name=".OpenWatchReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".ReplyReceiver"
+            android:exported="false" />
+
+        <activity
+            android:name=".QuickRepliesActivity"
+            android:exported="false" />
+
+        <!-- Invisible trampoline for "Open in app": launches the native-app deep
+             link from the FOREGROUND so it isn't blocked as a background launch.
+             Transparent + no-history so the user never sees it. -->
+        <activity
+            android:name=".OpenInAppActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity="" />
+
+        <!-- Facebook cookie-harvest login WebView. Launched from
+             FacebookMessengerService.startLogin. Only useful when the FB AAR +
+             FacebookMessengerService are present; harmless otherwise (it just
+             won't find the service). -->
+        <activity
+            android:name=".FbLoginActivity"
+            android:exported="false"
+            android:label="Facebook Login" />
+
+        <activity
+            android:name=".TelegramLoginActivity"
+            android:exported="false"
+            android:label="Telegram Login" />
+
+        <activity
+            android:name=".DiscordLoginActivity"
+            android:exported="false"
+            android:label="Discord Login" />
+
+    </application>
+</manifest>
