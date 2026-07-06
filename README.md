@@ -3,8 +3,8 @@
 **Mirror your phone's messages to a Pebble smartwatch.**
 
 MirrorMsg is an Android companion app that streams your conversations —
-Google Messages (RCS/SMS), WhatsApp, Telegram, Facebook Messenger, and a range
-of networks bridged through [Beeper](https://www.beeper.com/) — to a **Pebble
+Google Messages (RCS/SMS), WhatsApp, Telegram, Discord, Facebook Messenger, and a
+range of networks bridged through [Beeper](https://www.beeper.com/) — to a **Pebble
 Time Steel** watch. It runs entirely on your phone: there is no MirrorMsg server,
 and your messages and session credentials never leave your device.
 
@@ -25,13 +25,14 @@ your phone out.
 | WhatsApp | Linked-device pairing (phone code or QR). Reactions and replies. |
 | Telegram | MTProto login (phone → code → 2FA). Folders surface as sub-accounts. |
 | Facebook Messenger | Direct messages and group threads. |
+| Discord | Direct login. Servers and DMs, with per-server notification controls. |
 
 **Via Beeper** (optional — requires the Beeper app installed and signed in):
 
-Discord (DMs), Instagram, LinkedIn, Slack, Google Chat, Line, iMessage, Signal,
-X, and others. Beeper networks appear as additional accounts in the watch
-switcher and can be toggled individually. MirrorMsg is fully functional without
-Beeper — it's purely additive.
+Instagram, LinkedIn, Slack, Google Chat, Line, iMessage, Signal, X, and others.
+Beeper networks appear as additional accounts in the watch switcher and can be
+toggled individually. MirrorMsg is fully functional without Beeper — it's purely
+additive.
 
 > **Reactions:** you can *send* reactions from native accounts (Google, WhatsApp,
 > Telegram, Facebook). Beeper's content provider is send-text-only, so Beeper
@@ -79,7 +80,7 @@ To actually see messages on a watch, you need to supply:
 - **Your own Telegram API credentials** (`api_id` / `api_hash` from
   [my.telegram.org](https://my.telegram.org)) — see the build steps below.
 - **The Beeper app**, installed and signed in, *if* you want any Beeper-bridged
-  networks (Discord, Instagram, Slack, etc.). The native networks don't need it.
+  networks (Instagram, Slack, Signal, etc.). The native networks don't need it.
 
 In short: this repo gets you a buildable, installable Android app and the bridges
 behind it. The watch half is yours to provide.
