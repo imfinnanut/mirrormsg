@@ -76,19 +76,13 @@ To actually see messages on a watch, you need to supply:
   nothing to stream to — you'll have a working phone app that talks to no watch.
   This is a deliberate boundary, not a missing file; there is no `main.c` here to
   find.
-- **A Pebble Time Steel** (or another Basalt-platform Pebble). This is the target
-  hardware; other Pebble models aren't supported.
-- **Your own logins for each network.** Every bridge runs off a *harvested
-  session* — you authenticate through the app's own flows (Google's WebView,
-  WhatsApp's linked-device pairing, Telegram's phone/code/2FA, etc.). Nothing
-  syncs until you sign in to each network you want.
 - **Your own Telegram API credentials** (`api_id` / `api_hash` from
   [my.telegram.org](https://my.telegram.org)) — see the build steps below.
 - **The Beeper app**, installed and signed in, *if* you want any Beeper-bridged
   networks (Discord, Instagram, Slack, etc.). The native networks don't need it.
 
 In short: this repo gets you a buildable, installable Android app and the bridges
-behind it. The watch half and all account credentials are yours to provide.
+behind it. The watch half is yours to provide.
 
 ---
 
