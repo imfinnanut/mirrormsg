@@ -24,7 +24,7 @@ your phone out.
 | Google Messages (RCS/SMS) | The flagship path. Dual-SIM aware; RCS reactions and replies. |
 | WhatsApp | Linked-device pairing (phone code or QR). Reactions and replies. |
 | Telegram | MTProto login (phone → code → 2FA). Folders surface as sub-accounts. |
-| Facebook Messenger | Non-E2EE threads (groups, older chats). |
+| Facebook Messenger | Direct messages and group threads. |
 
 **Via Beeper** (optional — requires the Beeper app installed and signed in):
 
@@ -53,16 +53,42 @@ MirrorMsg has three parts:
   the real network protocols (libgm, messagix, whatsmeow, gotd) from harvested
   sessions.
 - **The Pebble watchapp** (C, Basalt platform) — receives AppMessages over
-  PebbleKit and renders the list / chat / image views. *See the note below.*
+  PebbleKit and renders the list / chat / image views. *Not included in this
+  repository — see "Before you build" below.*
 
 The phone↔watch protocol streams conversations, threads, and 4-bit palettized
 images sized to the watch's tiny heap budget.
 
-> **Note on the watchapp:** the Pebble C source (`main.c`) is currently developed
-> and built separately in [CloudPebble](https://cloudpebble.repebble.com) and is
-> **not yet part of this repository.** This repo contains the phone side (Android
-> app + Go bridges), which is the bulk of the project. The watchapp source may be
-> added here later.
+---
+
+## Before you build — what this repository is (and isn't)
+
+This repository is the **phone side** of MirrorMsg: the Android app and the Go
+bridges. That's the bulk of the project, but it is **not a complete, drop-in
+working system on its own.** Please read this before investing time in a build,
+so nothing surprises you afterward.
+
+To actually see messages on a watch, you need to supply:
+
+- **A MirrorMsg Pebble watchapp.** The Pebble watchapp (C, `main.c`) is
+  **developed separately and is not distributed in this repository.** Without a
+  compatible MirrorMsg watchapp installed on the Pebble, the Android app has
+  nothing to stream to — you'll have a working phone app that talks to no watch.
+  This is a deliberate boundary, not a missing file; there is no `main.c` here to
+  find.
+- **A Pebble Time Steel** (or another Basalt-platform Pebble). This is the target
+  hardware; other Pebble models aren't supported.
+- **Your own logins for each network.** Every bridge runs off a *harvested
+  session* — you authenticate through the app's own flows (Google's WebView,
+  WhatsApp's linked-device pairing, Telegram's phone/code/2FA, etc.). Nothing
+  syncs until you sign in to each network you want.
+- **Your own Telegram API credentials** (`api_id` / `api_hash` from
+  [my.telegram.org](https://my.telegram.org)) — see the build steps below.
+- **The Beeper app**, installed and signed in, *if* you want any Beeper-bridged
+  networks (Discord, Instagram, Slack, etc.). The native networks don't need it.
+
+In short: this repo gets you a buildable, installable Android app and the bridges
+behind it. The watch half and all account credentials are yours to provide.
 
 ---
 
