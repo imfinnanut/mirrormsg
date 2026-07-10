@@ -20,3 +20,7 @@ combined-go/out/
 *.aar
 *.jks
 keystore.properties
+
+hs_err_pid*.log
+
+hs_err_pid*.log

@@ -56,6 +56,10 @@ class DiscordService : MessagingService {
     override val supportsReactionSend = true   // gateway MessageReactionAdd/Remove
     override val supportsReplyTo = true         // ChannelMessageSendReply (message reference)
 
+    // Discord marks read via ChannelMessageAck (per-channel high-water mark), so
+    // acking the newest message clears the channel's unread + mention badge.
+    override val supportsMarkRead = true
+
     /**
      * Bring Discord online: start the gateway with the persisted token and wait
      * briefly for READY so the first conversation list isn't empty. Blocks
@@ -271,6 +275,17 @@ class DiscordService : MessagingService {
         else "{\"error\":\"reaction rejected\"}"
     }
 
+    // Mark the channel read on Discord up through messageId (ChannelMessageAck).
+    // The bridge answers {"ok":true} on success. Errors just log — fire-and-forget.
+    override fun markRead(conversationId: String, messageId: String): String {
+        return try {
+            bridge().markThreadRead(conversationId, messageId)
+        } catch (e: Throwable) {
+            LogStore.e(TAG, "DC markRead failed", e)
+            "{\"error\":\"${e.message}\"}"
+        }
+    }
+
     // The Discord bridge answers {"ok":true} on success, {"dcError":...} on failure.
     private fun bridgeOk(result: String): Boolean = try {
         org.json.JSONObject(result).optBoolean("ok", false)
@@ -424,7 +439,7 @@ class DiscordService : MessagingService {
          *  Reading reflects the Discord app; writing PATCHes only message_notifications
          *  so mute and everything else stay intact. gomobile maps Go int to Long. */
         fun serverNotifyLevel(guildId: String): Int =
-            try { bridge().guildNotifyLevel(guildId).toInt() } catch (_: Throwable) { 0 }
+            try { bridge().guildNotifyLevel(guildId).toInt() } catch (_: Throwable) { -1 }
 
         fun setServerNotifyLevel(guildId: String, level: Int): Boolean =
             try { org.json.JSONObject(bridge().setGuildNotifyLevel(guildId, level.toLong())).optBoolean("ok", false) }

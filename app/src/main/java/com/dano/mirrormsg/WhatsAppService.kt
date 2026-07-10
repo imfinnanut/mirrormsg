@@ -45,6 +45,10 @@ class WhatsAppService : MessagingService {
     override val supportsReplyTo = true
     override val supportsReactionSend = true
 
+    // WhatsApp (whatsmeow) sends read receipts; read state is a per-chat high-water
+    // mark, so marking the newest message read clears the thread. Opt into the seam.
+    override val supportsMarkRead = true
+
     // WhatsApp's brand green/teal family, kept under ~140 luma so the watch draws
     // white initials (matching the other accounts' branded look).
     override val avatarPalette = listOf("#128C7E", "#1EA362", "#075E54", "#25803D")
@@ -143,17 +147,7 @@ class WhatsAppService : MessagingService {
     override fun isLoggedIn(): Boolean =
         try { ensureBridge()?.isPaired() ?: false } catch (e: Throwable) { false }
 
-    override fun accountLabel(): String =
-        try {
-            // The logged-in WhatsApp number lives in whatsmeow's store (device JID),
-            // not in prefs — read it live off the cached bridge. Prefix "+" for display.
-            val n = ensureBridge()?.selfNumber()?.trim().orEmpty()
-            when {
-                n.isEmpty() -> ""
-                n.startsWith("+") -> n
-                else -> "+$n"
-            }
-        } catch (_: Throwable) { "" }
+    override fun accountLabel(): String = ""   // resolved from the device JID later
 
     // ---- Lifecycle ---------------------------------------------------------
 
@@ -347,6 +341,20 @@ class WhatsAppService : MessagingService {
             }
         } catch (_: Throwable) {}
         return result
+    }
+
+    // Mark the thread read on WhatsApp up through messageId. whatsmeow marks by a
+    // per-chat high-water mark, so the newest message clears the whole thread; the
+    // bridge resolves the group sender it needs. Fire-and-forget from the caller's
+    // view — errors just log.
+    override fun markRead(conversationId: String, messageId: String): String {
+        return try {
+            ensureBridge()?.markThreadRead(conversationId, messageId)
+                ?: "{\"error\":\"whatsapp bridge unavailable\"}"
+        } catch (e: Throwable) {
+            LogStore.e(TAG, "WhatsApp markRead failed", e)
+            "{\"error\":\"${e.message}\"}"
+        }
     }
 
     // Optimistically insert a just-sent message through LiveRouter (the received-

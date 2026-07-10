@@ -74,6 +74,58 @@ object MessageStore {
         return newest
     }
 
+    /** The messageID of the newest stored message (by timestamp), or "" if the
+     *  conversation has none. Used to mark a thread read UP THROUGH its latest
+     *  message when the user enters it on the watch. Mirrors [version]'s
+     *  newest-by-timestamp selection. */
+    @Synchronized
+    fun newestMessageId(ctx: Context, convoId: String): String {
+        val arr = load(ctx, convoId)
+        var newestTs = -1L
+        var newestId = ""
+        for (i in 0 until arr.length()) {
+            val m = arr.getJSONObject(i)
+            val ts = m.optString("timestamp").toLongOrNull() ?: 0L
+            if (ts >= newestTs) { newestTs = ts; newestId = msgId(m) }
+        }
+        return newestId
+    }
+
+    /** Preview of the newest stored message for a conversation: its text (media
+     *  rendered as a tag), the sending direction, and the timestamp (microseconds).
+     *  Used to patch a convo-list row whose bridge-provided preview lags behind a
+     *  just-seen message (notably an OUTGOING send, which some bridges are slow to
+     *  reflect in their conversation list). Returns null when the store is empty. */
+    @Synchronized
+    fun newestSnippet(ctx: Context, convoId: String): Snippet? {
+        val arr = load(ctx, convoId)
+        if (arr.length() == 0) return null
+        var newestTs = -1L
+        var newest: JSONObject? = null
+        for (i in 0 until arr.length()) {
+            val m = arr.getJSONObject(i)
+            val ts = m.optString("timestamp").toLongOrNull() ?: 0L
+            if (ts >= newestTs) { newestTs = ts; newest = m }
+        }
+        val m = newest ?: return null
+        var text = msgText(m)
+        if (text.isEmpty() && (hasMediaID(m) || hasInlineMedia(m))) text = "[Image]"
+        // Direction: mirror LiveRouter's tolerant isMe read (some outgoing rows
+        // carry no senderParticipant, so fall back to fromMe / OUTGOING status).
+        val sp = m.optJSONObject("senderParticipant")
+        val status = m.optJSONObject("messageStatus")?.optString("status") ?: ""
+        val isMe = (sp?.optBoolean("isMe", false) ?: false) ||
+                   m.optBoolean("isMe", false) ||
+                   m.optBoolean("fromMe", false) ||
+                   status.startsWith("OUTGOING")
+        return Snippet(text, isMe, newestTs)
+    }
+
+    /** Newest-message preview for a conversation. [timestampMicros] matches the
+     *  store's microsecond timestamps so callers can compare recency against a
+     *  bridge list row. */
+    data class Snippet(val text: String, val isMe: Boolean, val timestampMicros: Long)
+
     /**
      * A stable version token for a conversation: "<count>:<newestMessageID>".
      * Unlike a bare timestamp this doesn't drift when a message's status

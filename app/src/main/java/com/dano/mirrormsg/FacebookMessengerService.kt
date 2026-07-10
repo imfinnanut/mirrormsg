@@ -673,6 +673,10 @@ open class FacebookMessengerService : MessagingService {
     override val supportsReplyTo: Boolean get() = true
     override val supportsReactionSend: Boolean get() = true
 
+    // Messenger supports read receipts (via a watermark timestamp), so opt into
+    // the mark-read seam — drives both the notification action and browse-to-read.
+    override val supportsMarkRead: Boolean get() = true
+
     override fun sendReplyTo(
         conversationId: String, targetMessageId: String,
         targetFromMe: Boolean, text: String
@@ -696,6 +700,19 @@ open class FacebookMessengerService : MessagingService {
         // (actor = us), so the badge updates on its own — no optimistic insert.
         return try {
             fbBridge?.sendReaction(conversationId, targetMessageId, targetFromMe, emoji)
+                ?: errStr("no bridge")
+        } catch (e: Throwable) {
+            errJson(e)
+        }
+    }
+
+    // Mark the whole thread read on Facebook. Messenger marks read by a watermark
+    // timestamp, not a message id, so the bridge ignores messageId and uses the
+    // thread's newest activity — the caller's "mark up through this" intent maps to
+    // "mark the thread read" here. Same shape as sendReaction.
+    override fun markRead(conversationId: String, messageId: String): String {
+        return try {
+            fbBridge?.markThreadRead(conversationId, messageId)
                 ?: errStr("no bridge")
         } catch (e: Throwable) {
             errJson(e)

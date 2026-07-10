@@ -37,6 +37,15 @@ class PebbleListenerService : BasePebbleListenerService() {
     }
     @Volatile private var latestImgRequest = -1
 
+    // Idempotency guard for KEY_MARK_THREAD_READ. The watch fires that key on
+    // EVERY appearance of a thread (including reply-overlay close onto an already-
+    // visible thread), so we get duplicates by design. markRead is itself a no-op
+    // on an already-read thread, but this skips the redundant network round-trip:
+    // remember the last "convoId:newestMsgId" we marked and ignore an identical
+    // repeat. Cleared implicitly whenever a genuinely newer message arrives (the
+    // newestMsgId changes), so a new message in an open thread still re-marks.
+    @Volatile private var lastMarkedRead: String? = null
+
     internal val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     companion object {
@@ -53,6 +62,11 @@ class PebbleListenerService : BasePebbleListenerService() {
         // RIGHT edge; ~22 was the original; 15 sat MIDDLE. 29 = on the edge with a
         // one-space gap.
         private const val ENTER_ARROW_PAD = 29
+        // Max age of a stored message allowed to override a bridge's convo-list
+        // preview (see convoSnippet). Generous enough to cover "sent today, list
+        // still shows yesterday"; bounded so a stale store entry can't mask a
+        // genuinely newer bridge preview indefinitely. 24h.
+        private const val SNIPPET_STORE_MAX_AGE_MS = 24L * 60 * 60 * 1000
         private const val MSG_TEXT_MAX = 135
         private const val FULL_TEXT_MAX = 900   // cap for on-demand full text (one AppMessage)
         private const val SENDER_MAX = 22
@@ -358,6 +372,40 @@ class PebbleListenerService : BasePebbleListenerService() {
                 val job = scope.launch { streamImageByIndex(convoId, reqImg, full, budget, budgetMax, quality) }
                 imgJobs.add(job)
                 job.invokeOnCompletion { imgJobs.remove(job) }
+            }
+            return ReceiveResult.Ack
+        }
+
+        // Mark-thread-read: the watch fires this whenever a chat thread becomes the
+        // visible top of screen — manual nav, a force-open, OR backing out of a PN's
+        // detail view into the thread beneath (a case KEY_REQ_OPEN does NOT cover).
+        // Contract: receive it => mark that convo read. Fire-and-forget + duplicated,
+        // so the op is idempotent and guarded against redundant network calls.
+        val markRow = (data[Schema.KEY_MARK_THREAD_READ] as? PebbleDictionaryItem.Int32)?.value
+        if (markRow != null) {
+            // ENTER rows (buckets/servers) aren't threads — never mark those.
+            if (Mirror.navKinds.getOrNull(markRow) == 1) return ReceiveResult.Ack
+            val convoId = Mirror.convoOrder.getOrNull(markRow)
+            if (convoId != null) {
+                // The watch shows the ACTIVE account's list, so the convo at this
+                // index belongs to the active service (same basis openThread uses).
+                val svc = Mirror.activeService()
+                if (svc != null && svc.supportsMarkRead) {
+                    scope.launch {
+                        try {
+                            val newestId = MessageStore.newestMessageId(
+                                this@PebbleListenerService, convoId)
+                            if (newestId.isEmpty()) return@launch
+                            val token = "$convoId:$newestId"
+                            if (token == lastMarkedRead) return@launch  // idempotent skip
+                            val res = svc.markRead(convoId, newestId)
+                            lastMarkedRead = token
+                            LogStore.i(TAG, "Thread-read: markRead($convoId) -> $res")
+                        } catch (e: Exception) {
+                            LogStore.e(TAG, "KEY_MARK_THREAD_READ handling failed", e)
+                        }
+                    }
+                }
             }
             return ReceiveResult.Ack
         }
@@ -1270,17 +1318,62 @@ class PebbleListenerService : BasePebbleListenerService() {
             }
             val w = result.getInt("w"); val h = result.getInt("h")
             val pixels = Base64.decode(result.getString("pixels"), Base64.DEFAULT)
-            val imgFormat = result.optInt("fmt", 0)   // 0=8bpp, 1=4bpp palette
+            val imgFormat = result.optInt("fmt", 0)   // 0=8bpp, 1=palettized
+            // Packed bit depth for palettized images: 1/2/4. Absent => 4 (legacy).
+            // Only meaningful (and only sent) when fmt==1; the 8bpp path reports 8
+            // here but goes down the watch's non-palettized route, so we never tag
+            // a palettized frame with depth 8.
+            val imgDepth = result.optInt("depth", 4)
             val paletteB64 = result.optString("palette", "")
             val palette = if (paletteB64.isNotEmpty())
                 Base64.decode(paletteB64, Base64.DEFAULT) else ByteArray(0)
-            // Wipe only when the chosen full image won't fit the CURRENT budget
-            // (heap headroom). Cross-chat thumbnail collisions are handled on the
-            // watch now via (KEY_THREAD_TOKEN, row) cache keying, so no per-convo
-            // wipe is needed.
-            val wipeCache = full && pixels.size > curBudget
-            LogStore.i(TAG, "Image for msg $msgIdx: ${w}x${h}, ${pixels.size} bytes (fmt=$imgFormat wipe=$wipeCache)")
+            // NOTE: the wipe decision moves BELOW, after compression — for a
+            // compressed image the resident cost on the watch is the COMPRESSED
+            // size, not pixels.size, so comparing raw size here would trigger
+            // needless cache wipes (and mislabel the log). We log the raw size now
+            // and decide wipe against the real resident size once it's known.
+            LogStore.i(TAG, "Image for msg $msgIdx: ${w}x${h}, ${pixels.size} raw bytes (fmt=$imgFormat)")
             val sender = Mirror.sender(this)
+
+            // Phase 2 (heap engine): full-view palettized frames only. Row-compress
+            // a TIGHT-packed copy of the stream; ship compressed only if it's
+            // genuinely smaller than the raw (aligned) stream — otherwise raw wins
+            // and takes the untouched phase-1 native path (never worse than off).
+            var encoding = 0
+            var sendStream = pixels          // default: raw (word-aligned) stream
+            var restartIndex: ByteArray? = null
+            if (Mirror.imgCompress && full && imgFormat == 1) {
+                val tight = tightRows(pixels, w, imgDepth)   // strip word-align padding
+                if (tight != null) {
+                    val rc = rowCompress(tight.first, tight.second, h)
+                    // Heap comparison: compressed resident (comp+index) vs raw bitmap
+                    // (pixels.size). Only switch if it actually saves heap.
+                    if (rc.compressed.size + rc.index.size < pixels.size) {
+                        encoding = 1
+                        sendStream = rc.compressed
+                        restartIndex = rc.index
+                        LogStore.i(TAG, "COMPRESS msg $msgIdx: raw ${pixels.size} -> " +
+                            "${rc.compressed.size} bytes +${rc.index.size} idx " +
+                            "(${100 - rc.compressed.size * 100 / maxOf(1, pixels.size)}% heap saved)")
+                    } else {
+                        LogStore.i(TAG, "COMPRESS msg $msgIdx: raw wins " +
+                            "(${pixels.size} <= ${rc.compressed.size + rc.index.size}) — sending raw")
+                    }
+                }
+            }
+
+            // Wipe the watch's caches only when the image's ACTUAL RESIDENT size
+            // won't fit the current (no-wipe) budget. For a compressed image the
+            // resident cost is the compressed blob (+ index), NOT the raw decoded
+            // size — so a 13KB-raw image that compresses to 3.4KB no longer triggers
+            // a needless cache purge when 3.4KB fits the current headroom. Only when
+            // even the resident size overflows the current budget do we ask the watch
+            // to free its thumbnail caches. Cross-chat collisions are keyed on the
+            // watch via (KEY_THREAD_TOKEN,row), so this is purely a heap-fit decision.
+            val residentSize = if (encoding == 1) sendStream.size + (restartIndex?.size ?: 0)
+                               else pixels.size
+            val wipeCache = full && residentSize > curBudget
+            LogStore.i(TAG, "msg $msgIdx resident=$residentSize (enc=$encoding) vs curBudget=$curBudget -> wipe=$wipeCache")
 
             sender.sendDataToPebble(Schema.WATCH_UUID, mapOf(
                 Schema.KEY_IMG_START      to PebbleDictionaryItem.Int32(msgIdx),
@@ -1288,6 +1381,9 @@ class PebbleListenerService : BasePebbleListenerService() {
                 Schema.KEY_COUNT          to PebbleDictionaryItem.Int32(h),
                 Schema.KEY_MSG_IN         to PebbleDictionaryItem.Int32(incoming),
                 Schema.KEY_MSG_SENDER     to PebbleDictionaryItem.Text(senderName),
+                // KEY_TYPE = decoded (raw packed) size. For RAW this is the bitmap
+                // reserve; for COMPRESSED the watch reserves KEY_IMG_ENC_BYTES instead
+                // and uses this only as the expand-to size / row-count sanity.
                 Schema.KEY_TYPE           to PebbleDictionaryItem.Int32(pixels.size),
                 Schema.KEY_IMG_WIPE_CACHE to PebbleDictionaryItem.Int32(if (wipeCache) 1 else 0),
                 // LOAD-BEARING — do NOT drop as "redundant with the thread frame".
@@ -1297,19 +1393,34 @@ class PebbleListenerService : BasePebbleListenerService() {
                 // re-bleeds. Must stay on every IMG_START.
                 Schema.KEY_THREAD_TOKEN   to PebbleDictionaryItem.Int32(threadToken(convoId, Mirror.currentMsgPage)),
                 Schema.KEY_IMG_FORMAT     to PebbleDictionaryItem.Int32(imgFormat),
+                Schema.KEY_IMG_ENCODING   to PebbleDictionaryItem.Int32(encoding),
                 Schema.KEY_REQ_IMG_FULL   to PebbleDictionaryItem.Int32(if (full) 1 else 0)
             ) + (if (imgFormat == 1 && palette.isNotEmpty())
-                    mapOf(Schema.KEY_IMG_PALETTE to PebbleDictionaryItem.Bytes(palette))
+                    mapOf(
+                        Schema.KEY_IMG_PALETTE to PebbleDictionaryItem.Bytes(palette),
+                        Schema.KEY_IMG_DEPTH   to PebbleDictionaryItem.Int32(imgDepth)
+                    )
+                 else emptyMap())
+              + (if (encoding == 1)
+                    mapOf(
+                        Schema.KEY_IMG_ENC_BYTES   to PebbleDictionaryItem.Int32(sendStream.size),
+                        Schema.KEY_IMG_RESTART_IDX to PebbleDictionaryItem.Bytes(restartIndex!!)
+                    )
                  else emptyMap()),
             watches = null)
             delay(150)
 
-            var seq = 0; var offset = 0
-            while (offset < pixels.size) {
-                val end = minOf(offset + Schema.IMG_CHUNK_SIZE, pixels.size)
+            // Transport is identical for raw and compressed: fixed seq*380 chunks
+            // over the chosen stream. For compressed, the watch reassembles the
+            // compressed blob then decodes on draw; a dropped chunk damages only the
+            // rows spanning that gap (bounded by the restart index).
+            var seq = 0
+            var offset = 0
+            while (offset < sendStream.size) {
+                val end = minOf(offset + Schema.IMG_CHUNK_SIZE, sendStream.size)
                 sender.sendDataToPebble(Schema.WATCH_UUID, mapOf(
                     Schema.KEY_IMG_SEQ  to PebbleDictionaryItem.Int32(seq),
-                    Schema.KEY_IMG_DATA to PebbleDictionaryItem.Bytes(pixels.copyOfRange(offset, end))
+                    Schema.KEY_IMG_DATA to PebbleDictionaryItem.Bytes(sendStream.copyOfRange(offset, end))
                 ), watches = null)
                 delay(IMG_CHUNK_DELAY)
                 offset = end; seq++
@@ -1320,6 +1431,95 @@ class PebbleListenerService : BasePebbleListenerService() {
             LogStore.i(TAG, "Image stream complete for msg $msgIdx ($seq chunks)")
         } catch (e: Exception) {
             LogStore.e(TAG, "streamImage failed for msg $msgIdx", e)
+        }
+    }
+
+    // ---- Phase 2: heap-engine row compression encoder ---------------------
+    // Result of compressing one image: the concatenated per-row payloads and the
+    // uint16-LE restart index (compressed offset of every Nth row).
+    private class RowComp(val compressed: ByteArray, val index: ByteArray)
+
+    /**
+     * Strip word-align padding from the encoder's aligned stream down to TIGHT rows
+     * (the layout the watch decodes for compressed frames: ceil(w*depth/8) bytes/
+     * row, no 4-byte padding). Returns (tightBytes, tightRowStride) or null if the
+     * geometry doesn't line up (in which case the caller falls back to raw).
+     */
+    private fun tightRows(aligned: ByteArray, w: Int, depth: Int): Pair<ByteArray, Int>? {
+        if (depth != 1 && depth != 2 && depth != 4) return null
+        val ppb = 8 / depth
+        val tightRow = (w + ppb - 1) / ppb
+        val alignedRow = (tightRow + 3) and 3.inv()
+        if (alignedRow == 0 || aligned.size % alignedRow != 0) return null
+        val h = aligned.size / alignedRow
+        if (tightRow == alignedRow) return Pair(aligned, tightRow) // already tight
+        val out = ByteArray(tightRow * h)
+        for (y in 0 until h) {
+            System.arraycopy(aligned, y * alignedRow, out, y * tightRow, tightRow)
+        }
+        return Pair(out, tightRow)
+    }
+
+    private val RESTART_N = 8
+    private val REPEAT_ROW = 0x00.toByte()
+
+    /**
+     * Compress a tight-packed stream row-by-row (see the Phase-2 comment in Mirror's
+     * Schema). Each row is independent PackBits; a row byte-identical to the one
+     * above becomes a single 0x00 "repeat previous row" token — EXCEPT restart rows
+     * (every RESTART_N-th), which are always real so a seek lands on a decodable row.
+     * PackBits count byte: 1..127 => repeat next byte N times; 128..255 => copy the
+     * next (256-c) literals. 0x00 is never a PackBits count, so it's free as the
+     * whole-row repeat marker.
+     */
+    private fun rowCompress(tight: ByteArray, rowBytes: Int, h: Int): RowComp {
+        val comp = java.io.ByteArrayOutputStream()
+        val index = java.io.ByteArrayOutputStream()
+        var prevStart = -1  // offset of previous row in `tight`, or -1
+        for (y in 0 until h) {
+            val start = y * rowBytes
+            val isRestart = (y % RESTART_N == 0)
+            if (isRestart) {
+                val off = comp.size()
+                index.write(off and 0xFF); index.write((off ushr 8) and 0xFF)
+            }
+            val repeat = !isRestart && prevStart >= 0 &&
+                rowEquals(tight, start, prevStart, rowBytes)
+            if (repeat) {
+                comp.write(0x00) // REPEAT_ROW
+            } else {
+                packBitsRow(tight, start, rowBytes, comp)
+            }
+            prevStart = start
+        }
+        return RowComp(comp.toByteArray(), index.toByteArray())
+    }
+
+    private fun rowEquals(a: ByteArray, o1: Int, o2: Int, n: Int): Boolean {
+        for (i in 0 until n) if (a[o1 + i] != a[o2 + i]) return false
+        return true
+    }
+
+    /** PackBits-encode one row [start, start+n) into `out`. Never emits a 0x00 count. */
+    private fun packBitsRow(row: ByteArray, start: Int, n: Int, out: java.io.ByteArrayOutputStream) {
+        var i = 0
+        while (i < n) {
+            var runLen = 1
+            while (i + runLen < n && row[start + i + runLen] == row[start + i] && runLen < 127) runLen++
+            if (runLen >= 2) {
+                out.write(runLen)                 // 1..127 = repeat
+                out.write(row[start + i].toInt() and 0xFF)
+                i += runLen
+            } else {
+                var litLen = 1
+                while (i + litLen < n && litLen < 128) {
+                    if (i + litLen + 1 < n && row[start + i + litLen] == row[start + i + litLen + 1]) break
+                    litLen++
+                }
+                out.write((256 - litLen) and 0xFF)  // 128..255 = copy litLen literals
+                for (k in 0 until litLen) out.write(row[start + i + k].toInt() and 0xFF)
+                i += litLen
+            }
         }
     }
 
@@ -1334,7 +1534,21 @@ class PebbleListenerService : BasePebbleListenerService() {
 
     private suspend fun pushConversations() {
         try {
-            val svc = Mirror.activeService() ?: run { LogStore.w(TAG, "No service for auto-push"); return }
+            // AUTHORITATIVE RESYNC on watchapp open. The watch may hold stale state
+            // from before the phone's data was wiped (a roster of accounts that no
+            // longer exist, a selector pointing at a gone row). Before pushing, make
+            // the active account a REAL logged-in one (the persisted id — or the
+            // "google" default — may name a wiped account), so we never boot the
+            // watch into a dead account with an empty list and broken nav.
+            Mirror.ensureActiveLoggedIn(this)
+            val svc = Mirror.activeService() ?: run {
+                // Nothing logged in (e.g. right after a full wipe). Still send the
+                // authoritative (empty) roster so the watch discards its stale
+                // account list instead of showing accounts that no longer exist.
+                LogStore.w(TAG, "No service for auto-push — reporting empty roster")
+                reportServiceList()
+                return
+            }
             // A fresh watchapp open lands on the account's top level — clear any nav
             // context left from a prior session so the root list (and the cache) apply.
             Mirror.navStack.clear()
@@ -1440,7 +1654,14 @@ class PebbleListenerService : BasePebbleListenerService() {
             // the exact label/index order. lastSwitcherEntries records what the
             // watch is showing so a selected index maps back to a service+folder.
             val entries = Mirror.switcherEntries(this)
-            if (entries.size < 2) return
+            // ALWAYS report the authoritative roster, even at 0 or 1 account. The
+            // old `if (entries.size < 2) return` suppressed the push for a single
+            // account "because no switcher UI is needed" — but that left the watch
+            // showing a STALE roster after the phone's data is wiped (e.g. 3
+            // accounts drop to 1, but the watch never hears the count shrank, so
+            // its switcher indices no longer match the phone and nav/switch break).
+            // The watch adopts whatever roster we send as authoritative: 1 label =
+            // single account (no switcher chrome), 0 labels = nothing logged in.
             Mirror.lastSwitcherEntries = entries
             val labels = entries.joinToString("\u001e") { it.label }
             val activeIdx = entries.indexOfFirst {
@@ -1577,8 +1798,7 @@ class PebbleListenerService : BasePebbleListenerService() {
             // lands short of / past the edge.
             cf[Schema.KEY_SNIPPET]    = PebbleDictionaryItem.Text(
                 if (Mirror.navKinds.getOrNull(abs) == 1) "\u2192".padStart(ENTER_ARROW_PAD + 1)
-                else EmojiSub.processText(
-                    c.optJSONObject("latestMessage")?.optString("displayContent")?.take(60) ?: ""))
+                else EmojiSub.processText(convoSnippet(c)))
             cf[Schema.KEY_COLOR]      = PebbleDictionaryItem.Text(convoColor(c, ownerSvc))
             cf[Schema.KEY_TYPE]       = PebbleDictionaryItem.Int32(
                 when (c.optString("type")) {
@@ -1633,6 +1853,33 @@ class PebbleListenerService : BasePebbleListenerService() {
         // groups so DeepLink degrades to the inbox instead of the wrong thread.
         val address = if (others == 1) number else ""
         return ConvoTarget.from(protocol, address)
+    }
+
+    // The convo-list row preview. Prefer the newest message in our OWN store when
+    // it's recent, because a bridge's list preview can lag a just-seen message —
+    // notably an OUTGOING send (the phone's native app sends a text; libgm reflects
+    // it in live events, which we store, but its conversation-list snippet keeps
+    // showing the last INCOMING message until some later sync). The store is fed by
+    // those live events + thread catch-up, so it's the authoritative "latest we've
+    // seen." Recency-gate it so a stale store entry never masks a genuinely newer
+    // bridge preview (e.g. a message that arrived while the service was dead lands
+    // in the bridge list but not the store); that edge defers to the bridge and
+    // self-heals on the next event. Outgoing gets a "You: " prefix, like a normal
+    // messaging app's latest-preview line.
+    private fun convoSnippet(c: JSONObject): String {
+        val bridgePreview = c.optJSONObject("latestMessage")?.optString("displayContent")?.take(60) ?: ""
+        val convoId = c.optString("conversationID")
+        if (convoId.isEmpty()) return bridgePreview
+        val snip = MessageStore.newestSnippet(this@PebbleListenerService, convoId) ?: return bridgePreview
+        // Normalize the store's microsecond timestamp to millis (mirrors LiveRouter's
+        // tolerant read) and require it to be recent before overriding the bridge.
+        val tsRaw = snip.timestampMicros
+        val tsMillis = if (tsRaw > 1_000_000_000_000_000L) tsRaw / 1000 else tsRaw
+        val ageMs = System.currentTimeMillis() - tsMillis
+        val recent = tsMillis > 0 && ageMs in -120_000..SNIPPET_STORE_MAX_AGE_MS
+        if (!recent || snip.text.isEmpty()) return bridgePreview
+        val body = if (snip.isMe) "You: ${snip.text}" else snip.text
+        return body.take(60)
     }
 
     // Avatar background color for a conversation row, in priority order:

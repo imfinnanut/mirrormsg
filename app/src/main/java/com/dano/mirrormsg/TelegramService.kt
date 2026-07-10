@@ -77,68 +77,41 @@ class TelegramService : MessagingService {
     // ---- Universal data surface: STUBBED until read/send milestones ---------
 
     override fun listConversations(count: Int): String {
-        // Base account = Telegram's main chat list. Folder navigation is handled by
-        // listContext (via Mirror.navStack) now, not activeTgFolder.
+        // A folder sub-account is active -> show only that folder's chats.
+        val folder = Mirror.activeTgFolder
+        if (folder > 0) {
+            val fjson = try {
+                bridge().listFolderConversations(folder.toLong(), count.toLong())
+            } catch (e: Throwable) {
+                LogStore.w(TAG, "TG folder $folder list failed: ${e.message}")
+                return "{\"conversations\":[]}"
+            }
+            return if (fjson.startsWith("{")) fjson else "{\"conversations\":[]}"
+        }
         val json = try {
             bridge().listConversations(count.toLong())
         } catch (e: Throwable) {
             LogStore.w(TAG, "TG listConversations failed: ${e.message}")
             return "{\"conversations\":[]}"
         }
+        // TEMP diagnostics (remove once sub-accounts land): the conversation JSON,
+        // and a one-shot dump of chat folders (the grouping behind channel sub-accounts).
+        LogStore.i(TAG, "TG-CONVOS: ${json.take(1800)}")
+        if (!dumpedFolders) {
+            dumpedFolders = true
+            try {
+                val fj = bridge().listFolders()
+                LogStore.i(TAG, "TG-SUBACCOUNTS: $fj")
+                // Prove getPeerDialogs: resolve the first folder's chats to a full list.
+                val arr = org.json.JSONObject(fj).optJSONArray("folders")
+                val fid = arr?.optJSONObject(0)?.optInt("id", -1) ?: -1
+                if (fid >= 0) LogStore.i(TAG,
+                    "TG-FOLDERCONVOS[$fid]: ${bridge().listFolderConversations(fid.toLong(), 15L).take(1200)}")
+            } catch (e: Throwable) { LogStore.w(TAG, "TG folder diag failed: ${e.message}") }
+        }
+        // Bridge returns valid JSON on success; guard against a stray diagnostic.
         return if (json.startsWith("{")) json else "{\"conversations\":[]}"
     }
-
-    // Telegram is a hierarchy: root -> "Direct Messages" (main chat list) + shown
-    // folders -> that folder's chats. Same nav model as Discord; the watch drills via
-    // KEY_REQ_ENTER and the phone tracks the path in Mirror.navStack.
-    override val hierarchical = true
-
-    override fun listContext(count: Int, context: List<String>): String {
-        return when {
-            // Root: "Direct Messages" first, then each shown folder. No subtitles.
-            context.isEmpty() -> tgRootJson()
-            // The DMs bucket is Telegram's main chat list (all chats).
-            context.first() == "dms" -> {
-                val json = try { bridge().listConversations(count.toLong()) }
-                catch (e: Throwable) { LogStore.w(TAG, "TG main list failed: ${e.message}"); "{\"conversations\":[]}" }
-                if (json.startsWith("{")) json else "{\"conversations\":[]}"
-            }
-            // A folder: that folder's chats.
-            context.first().startsWith("folder:") -> {
-                val fid = context.first().removePrefix("folder:").toLongOrNull() ?: 0L
-                val json = try { bridge().listFolderConversations(fid, count.toLong()) }
-                catch (e: Throwable) { LogStore.w(TAG, "TG folder $fid failed: ${e.message}"); "{\"conversations\":[]}" }
-                if (json.startsWith("{")) json else "{\"conversations\":[]}"
-            }
-            else -> "{\"conversations\":[]}"
-        }
-    }
-
-    // The Telegram root list: an ENTER row for the main chat list ("Direct Messages"),
-    // then an ENTER row for each folder the user has shown (tgsub_enabled_*, default
-    // on), in the folder order. ENTER rows carry no snippet/unread (no subtitles).
-    private fun tgRootJson(): String {
-        val ctx = Mirror.appContext ?: return "{\"conversations\":[]}"
-        val convos = org.json.JSONArray()
-        convos.put(enterEntry("dms", "Direct Msgs"))
-        try {
-            val folders = org.json.JSONObject(foldersJson()).optJSONArray("folders")
-            if (folders != null) for (i in 0 until folders.length()) {
-                val f = folders.optJSONObject(i) ?: continue
-                val fid = f.optInt("id", -1); if (fid < 0) continue
-                if (!folderEnabled(ctx, fid)) continue
-                convos.put(enterEntry("folder:$fid", f.optString("title").ifEmpty { "Folder" }))
-            }
-        } catch (e: Throwable) { LogStore.w(TAG, "TG root build failed: ${e.message}") }
-        return org.json.JSONObject().put("conversations", convos).toString()
-    }
-
-    private fun enterEntry(context: String, name: String): org.json.JSONObject =
-        org.json.JSONObject()
-            .put("conversationID", context)   // unused for ENTER, keeps the shape
-            .put("name", name)
-            .put("navKind", "ENTER")
-            .put("navContext", context)
 
     override fun fetchMessages(conversationId: String, count: Long, cursor: String): String {
         val json = try {
@@ -172,6 +145,10 @@ class TelegramService : MessagingService {
     // reply_to / sendReaction). The interface defaults both to false.
     override val supportsReplyTo = true
     override val supportsReactionSend = true
+
+    // Telegram marks read via messages/channels.readHistory (a per-dialog high-water
+    // mark), so the newest message clears the thread. Opt into the mark-read seam.
+    override val supportsMarkRead = true
 
     override fun sendReplyTo(
         conversationId: String, targetMessageId: String,
@@ -208,6 +185,18 @@ class TelegramService : MessagingService {
     }
 
     override fun replyTokenFor(conversationId: String): String = ""   // convoId is the routing
+
+    // Mark the thread read on Telegram up through messageId. The bridge routes
+    // channel/supergroup vs DM/basic-group to the right readHistory RPC and parses
+    // the id (Telegram ids are ints). Errors just log — fire-and-forget.
+    override fun markRead(conversationId: String, messageId: String): String {
+        return try {
+            bridge().markThreadRead(conversationId, messageId)
+        } catch (e: Throwable) {
+            LogStore.e(TAG, "TG markRead failed", e)
+            "{\"error\":\"${e.message}\"}"
+        }
+    }
 
     private fun sentIdOf(result: String): String =
         try { org.json.JSONObject(result).optString("messageId") } catch (_: Throwable) { "" }
@@ -276,6 +265,7 @@ class TelegramService : MessagingService {
 
         private val lock = Any()
         @Volatile private var tgBridge: TgBridge? = null
+        @Volatile private var dumpedFolders = false  // one-shot TG-FOLDERS diagnostic
 
         /**
          * The single shared bridge — its gotd run loop lives process-wide, so login
@@ -321,14 +311,6 @@ class TelegramService : MessagingService {
         fun foldersJson(): String = try { bridge().listFolders() } catch (e: Throwable) {
             LogStore.w(TAG, "TG foldersJson failed: ${e.message}"); "{\"folders\":[]}"
         }
-
-        /**
-         * Whether a folder is shown in the watch's Telegram root list. Folders default
-         * ON (unlike Discord servers), matching the Networks-page toggle default; the
-         * pref key is shared with MainActivity's folder rows (tgsub_enabled_*).
-         */
-        fun folderEnabled(ctx: Context, folderId: Int): Boolean =
-            prefs(ctx).getBoolean("tgsub_enabled_$folderId", true)
 
         /** Called by TelegramLoginActivity once login reports "authorized". */
         fun markLoggedIn(ctx: Context, phone: String) {

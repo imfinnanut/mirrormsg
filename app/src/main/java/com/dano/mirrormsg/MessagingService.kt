@@ -216,6 +216,15 @@ interface MessagingService {
     val supportsReactionSend: Boolean get() = false
 
     /**
+     * Whether this service can mark a conversation read on the SOURCE network —
+     * propagating the read back to e.g. Google Messages, not merely clearing the
+     * local notification. Default false; opt in only when [markRead] is actually
+     * implemented. The notification's "Mark as read" action is added ONLY for
+     * services that return true, so the button never appears where it does nothing.
+     */
+    val supportsMarkRead: Boolean get() = false
+
+    /**
      * Send a quoted reply to [targetMessageId] within [conversationId]. Only
      * called when [supportsReplyTo] is true. [targetFromMe] is whether the message
      * being replied to was sent by us (some networks fold it into the target's
@@ -237,6 +246,16 @@ interface MessagingService {
         conversationId: String, targetMessageId: String,
         targetFromMe: Boolean, emoji: String
     ): String = throw UnsupportedOperationException("$id does not support reaction send")
+
+    /**
+     * Mark [conversationId] read UP THROUGH [messageId] on the source network
+     * (a real read receipt, so the thread's unread state clears on the network
+     * itself — not just a dismissed notification). Only called when
+     * [supportsMarkRead] is true. Returns the bridge's JSON response. Default
+     * throws — declaring support without implementing is a bug.
+     */
+    fun markRead(conversationId: String, messageId: String): String =
+        throw UnsupportedOperationException("$id does not support mark-read")
 
     /** Download+scale a media image for the watch. Returns the bridge's JSON. */
     fun downloadImage(

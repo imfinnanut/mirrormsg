@@ -37,6 +37,10 @@ class GoogleMessagesService : MessagingService {
     override val supportsReplyTo = true
     override val supportsReactionSend = true
 
+    // Google Messages can mark a thread read on the source (libgm read receipt),
+    // so the "Mark as read" notification action is offered for this network.
+    override val supportsMarkRead = true
+
     private val ctx: Context get() = Mirror.appContext!!
 
     // ---- Identity & state --------------------------------------------------
@@ -133,6 +137,20 @@ class GoogleMessagesService : MessagingService {
         } catch (e: Throwable) {
             LogStore.e("GoogleMessagesService", "sendReaction failed", e)
             JSONObject().put("error", e.message ?: "reaction send failed").toString()
+        }
+    }
+
+    // Mark a conversation read on Google Messages itself: libgm sends a read
+    // receipt up through messageId, clearing the thread's unread state on the
+    // source (not just dismissing the local notification). Errors return an error
+    // JSON so the receiver can log without crashing.
+    override fun markRead(conversationId: String, messageId: String): String {
+        return try {
+            Mirror.bridge?.markRead(conversationId, messageId)
+                ?: "{\"error\":\"no bridge\"}"
+        } catch (e: Throwable) {
+            LogStore.e("GoogleMessagesService", "markRead failed", e)
+            JSONObject().put("error", e.message ?: "mark-read failed").toString()
         }
     }
 

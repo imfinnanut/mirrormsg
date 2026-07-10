@@ -1,5 +1,20 @@
+import java.util.Properties
+import java.io.FileInputStream
+
 plugins {
     alias(libs.plugins.android.application)
+}
+
+// Release signing — reads credentials from keystore.properties at the repo root.
+// That file is gitignored and never committed; it holds the store/key passwords,
+// the alias, and the keystore filename. If it's absent (e.g. a fresh clone that
+// only ever builds debug), release signing is simply skipped and debug builds
+// are unaffected.
+val keystorePropsFile = rootProject.file("keystore.properties")
+val keystoreProps = Properties().apply {
+    if (keystorePropsFile.exists()) {
+        load(FileInputStream(keystorePropsFile))
+    }
 }
 
 android {
@@ -9,22 +24,28 @@ android {
             minorApiLevel = 1
         }
     }
-
     defaultConfig {
         applicationId = "com.dano.mirrormsg"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
-
+        versionCode = 8
+        versionName = "1.0.7"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-
         // arm64 only — Go bridge is the only native code now that GeckoView is gone.
         ndk {
             abiFilters += "arm64-v8a"
         }
     }
-
+    signingConfigs {
+        create("release") {
+            if (keystorePropsFile.exists()) {
+                storeFile = file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -32,6 +53,10 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Sign with the upload key only when keystore.properties is present.
+            if (keystorePropsFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
     compileOptions {
@@ -47,22 +72,17 @@ dependencies {
     if (file("libs/fbmessagebridge.aar").exists()) {
         implementation(files("libs/fbmessagebridge.aar"))
     }
-
     // PebbleKit Android 2 — phone <-> watch (JitPack).
     implementation("io.rebble.pebblekit2:client:0.1.0")
-
     // Coroutines (sendDataToPebble is a suspend function).
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
-
     // ZXing core — QR-code bitmap generation for the WhatsApp linked-device
     // pairing screen (Android has no built-in QR generator). Pure-Java, tiny.
     implementation("com.google.zxing:core:3.5.3")
-
     // Jetpack Security — EncryptedSharedPreferences for the license code (the
     // credential is never stored in plain prefs). 1.1.0-alpha06 is the widely-used
     // build; 1.0.0 has known keystore edge-cases on some devices.
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
-
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.material)

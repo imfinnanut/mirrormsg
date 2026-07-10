@@ -197,7 +197,7 @@ object LiveRouter {
                             LogStore.i(TAG, "Holding notification for downloading media msg $msgId (mode=${Mirror.notifyMode})")
                         } else {
                             if (hasImage && msgId.isNotEmpty()) imageForceOpened.add(msgId)
-                            routeIncoming(convoId, sender, body, groupName, silent, hasImage, ownerServiceId)
+                            routeIncoming(convoId, sender, body, groupName, silent, hasImage, ownerServiceId, msgId)
                         }
                     } else if (msgId.isNotEmpty() && heldForImage.contains(msgId)
                                && !imageForceOpened.contains(msgId)) {
@@ -208,7 +208,7 @@ object LiveRouter {
                             imageForceOpened.add(msgId)   // handled once
                             if (Mirror.notifyMode == Mirror.MODE_HYBRID) {
                                 LogStore.i(TAG, "Late image attach -> hybrid force-open for msg $msgId")
-                                routeIncoming(convoId, sender, body, groupName, silent, true, ownerServiceId)
+                                routeIncoming(convoId, sender, body, groupName, silent, true, ownerServiceId, msgId)
                             } else {
                                 // Notify mode: still a notification (routeIncoming's
                                 // mode check prevents a force-open), but pass TRUE so
@@ -216,13 +216,13 @@ object LiveRouter {
                                 // then lands on the enhanced view (straight to the
                                 // picture) instead of the chat thread.
                                 LogStore.i(TAG, "Late image attach -> notify [Image] for msg $msgId")
-                                routeIncoming(convoId, sender, body, groupName, silent, true, ownerServiceId)
+                                routeIncoming(convoId, sender, body, groupName, silent, true, ownerServiceId, msgId)
                             }
                         } else if (status == "INCOMING_COMPLETE") {
                             // Completed with no media after all -> notify text once.
                             imageForceOpened.add(msgId)
                             LogStore.i(TAG, "Held media never arrived -> notify text for msg $msgId")
-                            routeIncoming(convoId, sender, body, groupName, silent, false, ownerServiceId)
+                            routeIncoming(convoId, sender, body, groupName, silent, false, ownerServiceId, msgId)
                         }
                     }
                 }
@@ -385,7 +385,7 @@ object LiveRouter {
     }
 
     /** Route an incoming message per the selected notify mode. */
-    private fun routeIncoming(convoId: String, sender: String, body: String, groupName: String, silent: Boolean, hasImage: Boolean, ownerServiceId: String) {
+    private fun routeIncoming(convoId: String, sender: String, body: String, groupName: String, silent: Boolean, hasImage: Boolean, ownerServiceId: String, msgId: String) {
         val ctx = Mirror.appContext ?: return
         // Per-message silence from the source's own settings (e.g. a muted Discord
         // server/channel). Stored already, browsable on the watch — just no alert.
@@ -415,7 +415,7 @@ object LiveRouter {
         } else {
             // Notification (and Hybrid text): normal notification -> chat view on tap.
             LogStore.i(TAG, "routeIncoming: notification convo $convoId (mode=$mode)")
-            Notifier.postNewMessage(ctx, convoId, sender, body, ownerServiceId, groupName)
+            Notifier.postNewMessage(ctx, convoId, sender, body, ownerServiceId, msgId, groupName)
         }
     }
 

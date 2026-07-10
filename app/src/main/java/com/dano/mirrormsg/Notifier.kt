@@ -26,6 +26,7 @@ object Notifier {
 
     const val EXTRA_CONVO_ID = "com.dano.mirrormsg.CONVO_ID"
     const val EXTRA_SERVICE_ID = "com.dano.mirrormsg.SERVICE_ID"
+    const val EXTRA_MESSAGE_ID = "com.dano.mirrormsg.MESSAGE_ID"
     const val EXTRA_FROM_NOTIF = "com.dano.mirrormsg.FROM_NOTIF"
     const val KEY_REPLY_INPUT = "com.dano.mirrormsg.REPLY_INPUT"
 
@@ -149,7 +150,7 @@ object Notifier {
     }
 
     fun postNewMessage(ctx: Context, convoId: String, sender: String, body: String,
-                       ownerServiceId: String, groupName: String = "") {
+                       ownerServiceId: String, messageId: String = "", groupName: String = "") {
         ensureChannel(ctx)
 
         val contentPi = activityIntent(ctx, convoId, ownerServiceId)   // phone banner / "open on phone"
@@ -196,6 +197,28 @@ object Notifier {
             .addRemoteInput(remoteInput)
             .build()
 
+        // "Mark as read" -> BROADCAST to MarkReadReceiver, which asks the OWNING
+        // service to mark the thread read on the SOURCE network (up through this
+        // message) and clears the notification. Only offered when the owning
+        // service actually implements it (supportsMarkRead) — no dead button on
+        // networks that can't yet propagate a read. Bakes convo + owner + the
+        // triggering messageId (MarkRead needs the message, not just the convo).
+        val ownerSvc = ServiceRegistry.byId(ctx, ownerServiceId)
+        val markReadAction: Notification.Action? =
+            if (ownerSvc?.supportsMarkRead == true && messageId.isNotEmpty()) {
+                val markReadPi = PendingIntent.getBroadcast(
+                    ctx, convoId.hashCode() + 4,
+                    Intent(ctx, MarkReadReceiver::class.java)
+                        .putExtra(EXTRA_CONVO_ID, convoId)
+                        .putExtra(EXTRA_SERVICE_ID, ownerServiceId)
+                        .putExtra(EXTRA_MESSAGE_ID, messageId),
+                    // MUTABLE for the same reason as the watch intent: the baked
+                    // convo/message/owner vary per message and must not freeze.
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE)
+                Notification.Action.Builder(
+                    android.R.drawable.ic_menu_view, "Mark as read", markReadPi).build()
+            } else null
+
         // "Open on watch" routes through a BroadcastReceiver (no activity launch).
         val watchAction = Notification.Action.Builder(
             android.R.drawable.ic_menu_view, "Open on watch", watchPi).build()
@@ -218,7 +241,8 @@ object Notifier {
             .setAutoCancel(true)
             .setOnlyAlertOnce(true)
             .addAction(replyAction)
-            .addAction(watchAction)
+        if (markReadAction != null) builder.addAction(markReadAction)
+        builder.addAction(watchAction)
         if (phoneAction != null) builder.addAction(phoneAction)
 
         // Attach the actions as Android Wear actions — this is the channel Pebble
@@ -226,7 +250,8 @@ object Notifier {
         // Reply goes FIRST so it's the default highlighted action on the watch.
         val wearableExtender = Notification.WearableExtender()
             .addAction(replyAction)
-            .addAction(watchAction)
+        if (markReadAction != null) wearableExtender.addAction(markReadAction)
+        wearableExtender.addAction(watchAction)
         if (phoneAction != null) wearableExtender.addAction(phoneAction)
         builder.extend(wearableExtender)
 

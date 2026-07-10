@@ -130,11 +130,38 @@ build and run fine.
 
 ---
 
+## The image pipeline is a reusable library
+
+The code that turns a phone photo into something a 64-color Pebble can render —
+color quantization, automatic bit-depth reduction, adaptive dithering, and
+compression-aware sizing — lives in its own self-contained package,
+[`watchimage/`](watchimage/), with **no dependency on the rest of MirrorMsg**.
+It's pure Go (stdlib + `golang.org/x/image`), so you can drop it into your own
+project if you're targeting any low-color, low-RAM display — a Pebble, an e-paper
+badge, an ESP32 panel, a retro handheld.
+
+It handles the genuinely hard parts: picking only colors the hardware can show,
+choosing the smallest bit depth that still looks right, dithering *only* real
+gradients (leaving flat fills and text crisp), and sizing an image so its
+*compressed* footprint fits a fixed memory budget in a single pass.
+
+```
+go get github.com/killdano/mirrormsg/watchimage
+```
+
+See [`watchimage/README.md`](watchimage/README.md) for the full API, examples, and
+how to call it from Android via gomobile (as MirrorMsg does) or straight from Go.
+It's offered as a gift to anyone building for tiny screens — take it, use it,
+improve it.
+
+---
+
 ## Project layout
 
 ```
 app/                                  Android application (Kotlin)
   src/main/java/com/dano/mirrormsg/    services, routing, UI, watch streaming
+watchimage/                           reusable image pipeline — standalone Go library
 combined-go/                          Go bridge module (fi.mirrormsg)
   mirrorbridge/                        Google Messages (libgm)
   fbmessagebridge/                     Facebook Messenger (messagix)

@@ -471,6 +471,120 @@ class MainActivity : Activity() {
         addDivider(setCard, p)
         addHeapGuardRow(setCard, p)
         c.addView(setCard)
+
+        // ---- IMAGE QUALITY ------------------------------------------------
+        sectionLabel(c, p, "Image quality")
+        val iqCard = card(p)
+        iqCard.addView(TextView(this).apply {
+            text = "Images use as many colors as they need, up to a limit. " +
+                "The sliders decide how readily a busy image settles for fewer " +
+                "colors — lower = fewer colors more often (smaller, faster), " +
+                "higher = keep more colors."
+            textSize = 13f; setTextColor(p.subtext)
+            setPadding(0, dp(2), 0, dp(10))
+        })
+        addColorCapRow(iqCard, p, "Thumbnail color limit",
+            "Max colors for chat-view previews.", Mirror.imgThumbCap) { colors ->
+            Mirror.setImgThumbCap(this, colors)
+        }
+        addDivider(iqCard, p)
+        addCoverageSliderRow(iqCard, p, "Thumbnail colors",
+            Mirror.imgThumbCoverage) { pct -> Mirror.setImgThumbCoverage(this, pct) }
+        addDivider(iqCard, p)
+        addColorCapRow(iqCard, p, "Full-size color limit",
+            "Max colors for the opened image.", Mirror.imgFullCap) { colors ->
+            Mirror.setImgFullCap(this, colors)
+        }
+        addDivider(iqCard, p)
+        addCoverageSliderRow(iqCard, p, "Full-size colors",
+            Mirror.imgFullCoverage) { pct -> Mirror.setImgFullCoverage(this, pct) }
+        addDivider(iqCard, p)
+        addToggleRow(iqCard, p, "Compress large images",
+            "Keep full-size images compressed in watch memory so bigger images fit.",
+            Mirror.imgCompress) { on -> Mirror.setImgCompress(this, on) }
+        addDivider(iqCard, p)
+        addDitherSection(iqCard, p)
+        c.addView(iqCard)
+    }
+
+    // Dithering: a switch that reveals three sliders (edge protection, strength,
+    // intensity). Simulates more colours on smooth gradients by blending palette
+    // colours, at a compression cost — so it's opt-in. The sliders are disabled
+    // (greyed) until the switch is on.
+    private fun addDitherSection(parent: LinearLayout, p: Palette) {
+        val sliders = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        fun setEnabled(on: Boolean) {
+            sliders.alpha = if (on) 1f else 0.4f
+            fun walk(v: android.view.View) {
+                v.isEnabled = on
+                if (v is ViewGroup) for (i in 0 until v.childCount) walk(v.getChildAt(i))
+            }
+            walk(sliders)
+        }
+        addToggleRow(parent, p, "Dither gradients",
+            "Blend palette colors to smooth gradients and simulate more colors. " +
+            "Flat areas and hard edges stay crisp.",
+            Mirror.imgDither) { on -> Mirror.setImgDither(this, on); setEnabled(on) }
+        addSliderRow(sliders, p, "Edge protection",
+            "Higher keeps more edges crisp.", Mirror.imgDitherEdge,
+            "softer  \u2190          \u2192  crisper") { v -> Mirror.setImgDitherEdge(this, v) }
+        addSliderRow(sliders, p, "Dither strength",
+            "Higher dithers more of the image.", Mirror.imgDitherStrength,
+            "less  \u2190          \u2192  more") { v -> Mirror.setImgDitherStrength(this, v) }
+        addSliderRow(sliders, p, "Dither intensity",
+            "Higher = stronger texture; lower = softer and more compressible.",
+            Mirror.imgDitherIntensity,
+            "soft  \u2190          \u2192  strong") { v -> Mirror.setImgDitherIntensity(this, v) }
+        parent.addView(sliders)
+        setEnabled(Mirror.imgDither)
+    }
+
+    // Generic 0-100 slider row with a caption. Value label updates live; onChange
+    // fires on release.
+    private fun addSliderRow(parent: LinearLayout, p: Palette, title: String,
+                             sub: String, current: Int, caption: String,
+                             onChange: (Int) -> Unit) {
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val titles = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        titles.addView(TextView(this).apply {
+            text = title; textSize = 16f; setTextColor(p.text)
+        })
+        titles.addView(TextView(this).apply {
+            text = sub; textSize = 13f; setTextColor(p.subtext)
+        })
+        header.addView(titles, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val valueLabel = TextView(this).apply {
+            text = "$current"; textSize = 14f; setTextColor(p.subtext)
+        }
+        header.addView(valueLabel)
+        col.addView(header)
+        val seek = android.widget.SeekBar(this).apply {
+            max = 100
+            progress = current.coerceIn(0, 100)
+            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: android.widget.SeekBar?, prog: Int, fromUser: Boolean) {
+                    valueLabel.text = "$prog"
+                }
+                override fun onStartTrackingTouch(sb: android.widget.SeekBar?) {}
+                override fun onStopTrackingTouch(sb: android.widget.SeekBar?) {
+                    onChange(sb?.progress ?: 0)
+                }
+            })
+        }
+        col.addView(seek, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        col.addView(TextView(this).apply {
+            text = caption; textSize = 11f; setTextColor(p.subtext)
+        })
+        parent.addView(col)
     }
 
     // ---- Accounts tab -----------------------------------------------------
@@ -1269,6 +1383,92 @@ class MainActivity : Activity() {
     // declines more images under pressure. The watch hard-clamps the effective
     // floor to a 600-byte minimum, so "Off" just means minimal protection.
     // Part of the same memory-tuning family as the two cache limits above.
+    // ---- Image quality helper rows ----------------------------------------
+    // Colour-cap picker: a small spinner of 2 / 4 / 16 (the three watch-supported
+    // palette sizes). onPick gets the chosen colour COUNT.
+    private fun addColorCapRow(parent: LinearLayout, p: Palette, title: String,
+                               subtitle: String, current: Int, onPick: (Int) -> Unit) {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        val txt = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        txt.addView(TextView(this).apply {
+            text = title; textSize = 16f; setTextColor(p.text)
+        })
+        txt.addView(TextView(this).apply {
+            text = subtitle; textSize = 13f; setTextColor(p.subtext)
+        })
+        val options = listOf(2, 4, 16)
+        val spinner = android.widget.Spinner(this).apply {
+            adapter = android.widget.ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                options.map { "$it colors" }).apply {
+                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            }
+            setSelection(options.indexOf(current).coerceAtLeast(0))
+            onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: android.widget.AdapterView<*>?,
+                                            view: android.view.View?, pos: Int, id: Long) {
+                    val picked = options[pos]
+                    if (picked != current) onPick(picked)
+                }
+                override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+            }
+        }
+        row.addView(txt, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(spinner, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        parent.addView(row)
+    }
+
+    // Coverage slider: a SeekBar mapped to 10-100% with a live "fewer <-> more
+    // colours" caption and the current percent. onChange fires on release.
+    private fun addCoverageSliderRow(parent: LinearLayout, p: Palette, title: String,
+                                     currentPct: Int, onChange: (Int) -> Unit) {
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        header.addView(TextView(this).apply {
+            text = title; textSize = 16f; setTextColor(p.text)
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val valueLabel = TextView(this).apply {
+            text = "$currentPct%"; textSize = 14f; setTextColor(p.subtext)
+        }
+        header.addView(valueLabel, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        col.addView(header)
+        val seek = android.widget.SeekBar(this).apply {
+            max = 90                       // 0..90 maps to 10..100%
+            progress = (currentPct - 10).coerceIn(0, 90)
+            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: android.widget.SeekBar?, prog: Int, fromUser: Boolean) {
+                    valueLabel.text = "${prog + 10}%"
+                }
+                override fun onStartTrackingTouch(sb: android.widget.SeekBar?) {}
+                override fun onStopTrackingTouch(sb: android.widget.SeekBar?) {
+                    onChange((sb?.progress ?: 0) + 10)
+                }
+            })
+        }
+        col.addView(seek, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        val caption = TextView(this).apply {
+            text = "fewer colors  \u2190          \u2192  more colors"
+            textSize = 11f; setTextColor(p.subtext)
+        }
+        col.addView(caption)
+        parent.addView(col)
+    }
+
     private fun addHeapGuardRow(parent: LinearLayout, p: Palette) {
         // Option values in bytes, and their human labels for the dropdown.
         val values = listOf(0, 600, 800, 1000, 1500, 2000, 3000)
@@ -1381,6 +1581,11 @@ class MainActivity : Activity() {
             private val litLabel  = intArrayOf(0xFFFFFFFF.toInt(), 0xFF201A00.toInt(), 0xFFFFFFFF.toInt())
             private val offFace   = intArrayOf(0xFF12331C.toInt(), 0xFF332B0E.toInt(), 0xFF351A1A.toInt())
             private val offLabel  = intArrayOf(0xFF4E8C66.toInt(), 0xFF8C7638.toInt(), 0xFF7C4A4A.toInt())
+            // Unknown state (level < 0): no data at all for this guild, so we don't
+            // claim a setting. All segments render in a neutral dim grey — reads as
+            // "unavailable" rather than a wrong "all notifications".
+            private val unkFace   = 0xFF26282C.toInt()
+            private val unkLabel  = 0xFF55585E.toInt()
             init {
                 layoutParams = LinearLayout.LayoutParams(dp(84), dp(34)).apply {
                     leftMargin = dp(4); rightMargin = dp(4)
@@ -1435,7 +1640,12 @@ class MainActivity : Activity() {
                     val right = left + segW
                     val rect = android.graphics.RectF(left, inset, right, h - inset)
                     val gc: Int
-                    if (i == level) {
+                    if (level < 0) {
+                        // Unknown: neutral dim grey for every segment, nothing lit.
+                        face.color = unkFace
+                        canvas.drawRoundRect(rect, rad, rad, face)
+                        gc = unkLabel
+                    } else if (i == level) {
                         // Lit: glow ring + top-lit gradient of the ACTIVE colour.
                         ring.color = litGlow[level]; ring.strokeWidth = dp(2).toFloat()
                         canvas.drawRoundRect(rect, rad, rad, ring)
@@ -1497,7 +1707,10 @@ class MainActivity : Activity() {
             MuteState.setMuted(this, serviceId, desired)
         },
         onAttach: (refresh: () -> Unit) -> Unit = {},
-        onDetach: () -> Unit = {}
+        onDetach: () -> Unit = {},
+        // When true, we have no data about this account's mute state, so the button
+        // renders neutral dim grey rather than implying "not muted" (dim red).
+        isUnknownProvider: () -> Boolean = { false }
     ): android.view.View {
         return object : android.view.View(this) {
             private var muted = isMutedProvider()
@@ -1550,7 +1763,12 @@ class MainActivity : Activity() {
                 val inset = dp(4).toFloat()
                 val r = dp(5).toFloat()
                 val rect = android.graphics.RectF(inset, inset, w - inset, h - inset)
-                if (muted) {
+                if (isUnknownProvider()) {
+                    // Unknown: neutral dim grey, no red — we don't claim a mute state.
+                    face.color = 0xFF26282C.toInt()
+                    canvas.drawRoundRect(rect, r, r, face)
+                    label.color = 0xFF55585E.toInt()
+                } else if (muted) {
                     // Lit: glow ring, then a top-lit red gradient face.
                     ring.color = 0x66FF5A4D.toInt(); ring.strokeWidth = dp(3).toFloat()
                     canvas.drawRoundRect(rect, r, r, ring)
@@ -1820,7 +2038,11 @@ class MainActivity : Activity() {
                 }.start()
             },
             onAttach = { refresh -> DiscordService.registerSettingRefresher("$guildId#mute", refresh) },
-            onDetach = { DiscordService.unregisterSettingRefresher("$guildId#mute") }
+            onDetach = { DiscordService.unregisterSettingRefresher("$guildId#mute") },
+            // Grey the mute button out when we have no settings data for this guild
+            // at all (notify level resolves to -1 = unknown), matching the notify
+            // control's dim state rather than implying "not muted".
+            isUnknownProvider = { DiscordService.serverNotifyLevel(guildId) < 0 }
         ))
         row.addView(sw)
         parent.addView(row)
