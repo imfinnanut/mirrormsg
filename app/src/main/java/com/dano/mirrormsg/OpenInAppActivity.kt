@@ -36,7 +36,7 @@ class OpenInAppActivity : Activity() {
         if (deep == null) {
             // Owning app not installed/resolvable — open MirrorMsg on this convo.
             LogStore.i("MirrorMsgSpike", "OpenInApp(activity): no native app for ${serviceId ?: "?"} — opening MirrorMsg")
-            openSelf(convoId)
+            openSelf(convoId, serviceId)
             finish(); return
         }
         try {
@@ -48,18 +48,21 @@ class OpenInAppActivity : Activity() {
             // The app vanished between build and tap (or refused the intent) —
             // don't leave the user on nothing; open MirrorMsg instead.
             LogStore.e("MirrorMsgSpike", "OpenInApp(activity): launch failed, opening MirrorMsg", e)
-            openSelf(convoId)
+            openSelf(convoId, serviceId)
         }
         finish()
     }
 
-    private fun openSelf(convoId: String) {
+    // MirrorMsg on this conversation, with its owning account, so the watch opens it
+    // there (MainActivity.handleNotificationLaunch) rather than under the active one.
+    private fun openSelf(convoId: String, serviceId: String?) {
         try {
             startActivity(Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or
                         Intent.FLAG_ACTIVITY_CLEAR_TOP or
                         Intent.FLAG_ACTIVITY_SINGLE_TOP
                 putExtra(Notifier.EXTRA_CONVO_ID, convoId)
+                if (serviceId != null) putExtra(Notifier.EXTRA_SERVICE_ID, serviceId)
                 putExtra(Notifier.EXTRA_FROM_NOTIF, true)
             })
         } catch (e: Exception) {

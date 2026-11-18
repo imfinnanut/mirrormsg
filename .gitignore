@@ -1,5 +1,6 @@
 *.iml
 .gradle
+.kotlin/
 /local.properties
 /.idea/caches
 /.idea/libraries
@@ -20,7 +21,15 @@ combined-go/out/
 *.aar
 *.jks
 keystore.properties
+*.bak
+bind_err.txt
 
+# Logs and crash dumps (they hold personal data)
 hs_err_pid*.log
+crash.txt
+mirrormsg_log*.txt
 
-hs_err_pid*.log
+# Stray local files
+/adb
+/}adb
+/_fb_pending/

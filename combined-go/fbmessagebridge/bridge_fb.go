@@ -34,25 +34,42 @@
 package fbmessagebridge
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/fnv"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/png"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"reflect"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
+	// WebP decoding for stickers (Messenger's are WebP, which the shared watch
+	// encoder doesn't read): converted to PNG here before encoding.
+	"golang.org/x/image/webp"
 
 	// Reuse the EXACT watch image encoder Google/WhatsApp use (scale + 4bpp
 	// palettize) so Facebook photos render identically. We only do the FB-specific
 	// attachment-URL download here, then hand raw bytes to EncodeImageForWatch.
-	"fi.mirrormsg/mirrorbridge"
+	"fi.mirrormsg/mediaroute"
+	"fi.mirrormsg/watchimage"
 
 	// VERIFY: import paths for the messagix package family. The Client lives in
 	// pkg/messagix; cookies and the table/event types live in subpackages. The
@@ -64,8 +81,9 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
+	"go.mau.fi/mautrix-meta/pkg/messagix/useragent"
 
-	// --- Facebook E2EE (Milestone-0 de-risk spike) ---
+	// --- Facebook E2EE ---
 	// Pure-Go SQLite — registers a database/sql driver named "sqlite". MUST be
 	// modernc, never cgo mattn (cgo breaks gomobile). Same driver native WhatsApp
 	// uses for its whatsmeow store; here it backs a SEPARATE fbe2ee.db.
@@ -80,6 +98,11 @@ import (
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
 	waConsumerApplication "go.mau.fi/whatsmeow/proto/waConsumerApplication"
 	waMsgApplication "go.mau.fi/whatsmeow/proto/waMsgApplication"
+	// Messenger-app ("armadillo") messages in encrypted chats: share cards
+	// (links, posts, reels, locations, story replies).
+	"go.mau.fi/whatsmeow/proto/armadilloutil"
+	waArmadilloApplication "go.mau.fi/whatsmeow/proto/waArmadilloApplication"
+	waArmadilloXMA "go.mau.fi/whatsmeow/proto/waArmadilloXMA"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	waTypes "go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -145,6 +168,16 @@ type Bridge struct {
 	imgMu   sync.Mutex
 	imgURLs map[string]fbImg
 
+	// vidURLs maps an FB messageId -> the video attachment's playable URL(s),
+	// captured from LSInsertBlobAttachment rows and guarded by imgMu. The watch
+	// asks for a video by messageId; DownloadMediaToFile fetches it on demand.
+	// In-memory only, for the same reason as imgURLs.
+	vidURLs map[string]fbVid
+
+	// audURLs is vidURLs for audio attachments (voice messages, audio files),
+	// served by the same DownloadMediaToFile. Guarded by imgMu, in-memory only.
+	audURLs map[string]fbAud
+
 	// contactNames maps an FB contactId -> display name, harvested from the
 	// LSVerifyContactRowExists / LSDeleteThenInsertContact rows that arrive in
 	// every sync. Used to name 1:1 DM threads, whose thread row has no name of
@@ -152,6 +185,21 @@ type Bridge struct {
 	// sync; the Kotlin side persists the resolved conversation names.
 	contactMu    sync.Mutex
 	contactNames map[int64]string
+
+	// Chat photos (see harvestAvatars), harvested from the same rows as the
+	// names. contactPic: a person's profile picture addresses, by contactId.
+	// threadPic: a group's own picture, by thread key (a group without one isn't
+	// in it; plainGroups holds the groups whose row came with an address that
+	// isn't their own picture, for the diag line). avatarAsked: when a person's
+	// row was last asked for (refreshContact). avatarCounts: the counts last
+	// logged. Guarded by avatarMu, in-memory: the addresses are signed and
+	// lapse, and every sync brings fresh ones.
+	avatarMu     sync.Mutex
+	contactPic   map[int64]fbContactPic
+	threadPic    map[int64]fbPicURL
+	plainGroups  map[int64]struct{}
+	avatarAsked  map[int64]int64
+	avatarCounts [3]int
 
 	// reactions maps messageId -> actorId -> emoji, harvested from the reaction
 	// rows in each delta. LSUpsertReaction sets an actor's emoji (an empty
@@ -214,12 +262,148 @@ type Bridge struct {
 	e2eeImgMu    sync.Mutex
 	e2eeImgXport map[string]*waMediaTransport.WAMediaTransport_Integral
 	e2eeImgOrder []string
+
+	// Retained E2EE video and audio transports, keyed "v:"+messageId and
+	// "a:"+messageId and guarded by e2eeImgMu. The full WAMediaTransport is kept
+	// (not just the integral) so the file length is known before downloading.
+	// Bounded FIFO like the image map, and persisted to the same mirror_img_xport
+	// table under the same keys.
+	e2eeVidXport map[string]*waMediaTransport.WAMediaTransport
+	e2eeVidOrder []string
+
+	// Videos written recently by DownloadMediaToFile, so a second request for the
+	// same one (the phone's preview and full animation) reuses the file.
+	vidDoneMu    sync.Mutex
+	vidDone      map[string]fbVidFile
+	vidDoneOrder []string
+
+	// --- History backfill (mirrors mautrix-meta's connector) ---
+	// A cookie/Lightspeed history page is requested with FetchMessagesTask and
+	// arrives ASYNCHRONOUSLY as a later PublishResponse delta (message rows in
+	// LSUpsertMessage/LSInsertMessage plus an LSInsertNewMessageRange). While a
+	// collector is registered for a threadKey, emitTableDeltas routes that thread's
+	// message rows into the collector instead of emitting them live, and feeds it
+	// the range so FetchMessages knows the next-older anchor and whether the top of
+	// the thread has been reached.
+	bfMu         sync.Mutex
+	bfCollectors map[int64]*fbBackfill
+
+	// Oldest (message id, ts) seen per thread, harvested as messages flow through
+	// emitTableDeltas. Fallback anchor for the first history fetch when the Kotlin
+	// side supplies no cursor: messagix needs a concrete ReferenceMessageId to page
+	// before, and this bridge keeps no message store of its own. The Kotlin cursor
+	// (oldest LOADED message) is preferred; this covers the first call before that
+	// plumbing lands.
+	oldestMu   sync.Mutex
+	oldestSeen map[int64]fbAnchor
 }
 
-// fbImg is one image attachment's download info.
+// fbImg is one image attachment's download info. Sticker marks a sticker, whose
+// transparent background is flattened onto white before encoding.
 type fbImg struct {
-	URL  string
-	Mime string
+	URL     string
+	Mime    string
+	Sticker bool
+}
+
+// fbVid is one video attachment's download info. Poster is the attachment's
+// preview image URL (a still frame), served through the image download under
+// the "p:"+messageId key. GifLike marks Messenger GIFs delivered as mp4.
+type fbVid struct {
+	URL      string
+	Fallback string
+	Mime     string
+	Size     int64
+	Poster   string
+	PosterMT string
+	GifLike  bool
+}
+
+// fbAud is one audio attachment's download info. Voice marks a voice message
+// (Messenger's audio type) as opposed to an audio file sent as an attachment.
+type fbAud struct {
+	URL      string
+	Fallback string
+	Mime     string
+	Size     int64
+	Voice    bool
+}
+
+// fbAnchor is a (message id, timestamp-ms) pair. FB's FetchMessagesTask pages
+// history strictly OLDER than this point; a timestamp alone is not enough, the
+// message id must be concrete or Meta returns no page.
+type fbAnchor struct {
+	MsgId string
+	TsMs  int64
+}
+
+// fbBackfill collects one thread's async history page(s). A FetchMessagesTask is
+// fired; the resulting message rows arrive on a later PublishResponse and are
+// appended here by emitTableDeltas via add(), and the accompanying
+// LSInsertNewMessageRange is fed in via applyRange(). pageCh signals each page
+// boundary so FetchMessages can decide whether to page again or stop.
+type fbBackfill struct {
+	mu       sync.Mutex
+	want     int              // target message count (0 = until top of thread)
+	msgs     []map[string]any // collected payloads, arrival order
+	seen     map[string]bool  // dedupe by messageId
+	minId    string           // oldest range id observed so far (next anchor)
+	minTs    int64            // oldest range ts observed so far (next anchor)
+	hasMore  bool             // Range.HasMoreBefore from the most recent page
+	gotRange bool             // whether any range row has been observed
+	pageCh   chan struct{}    // buffered(1); one signal per page boundary
+}
+
+func newFbBackfill(want int) *fbBackfill {
+	return &fbBackfill{
+		want:   want,
+		seen:   make(map[string]bool),
+		pageCh: make(chan struct{}, 1),
+	}
+}
+
+func (bf *fbBackfill) add(messageId string, payload map[string]any) {
+	bf.mu.Lock()
+	defer bf.mu.Unlock()
+	if messageId != "" {
+		if bf.seen[messageId] {
+			return
+		}
+		bf.seen[messageId] = true
+	}
+	bf.msgs = append(bf.msgs, payload)
+}
+
+func (bf *fbBackfill) applyRange(minId string, minTs int64, hasMore bool) {
+	bf.mu.Lock()
+	bf.gotRange = true
+	bf.hasMore = hasMore
+	if minId != "" {
+		bf.minId = minId
+	}
+	if minTs > 0 {
+		bf.minTs = minTs
+	}
+	bf.mu.Unlock()
+	// Signal the page boundary without ever blocking the event goroutine.
+	select {
+	case bf.pageCh <- struct{}{}:
+	default:
+	}
+}
+
+func (bf *fbBackfill) snapshot() (n int, minId string, minTs int64, hasMore, gotRange bool) {
+	bf.mu.Lock()
+	defer bf.mu.Unlock()
+	return len(bf.msgs), bf.minId, bf.minTs, bf.hasMore, bf.gotRange
+}
+
+func (bf *fbBackfill) collected() []map[string]any {
+	bf.mu.Lock()
+	defer bf.mu.Unlock()
+	out := make([]map[string]any, len(bf.msgs))
+	copy(out, bf.msgs)
+	return out
 }
 
 func newLogger() zerolog.Logger {
@@ -347,10 +531,14 @@ func newBridgeImpl(sessionJSON string, platform types.Platform, sink EventSink) 
 		cancel:         cancel,
 		threadActivity: make(map[int64]int64),
 		imgURLs:        make(map[string]fbImg),
+		vidURLs:        make(map[string]fbVid),
+		audURLs:        make(map[string]fbAud),
 		contactNames:   make(map[int64]string),
 		reactions:      make(map[string]map[int64]string),
 		midStamp:       make(map[string]string),
 		e2eeStampID:    make(map[string]string),
+		bfCollectors:   make(map[int64]*fbBackfill),
+		oldestSeen:     make(map[int64]fbAnchor),
 	}
 	if sessionJSON != "" {
 		ck, err := b.parseCookieJSON(sessionJSON)
@@ -445,7 +633,7 @@ func (b *Bridge) handleEvent(ctx context.Context, evt any) {
 		b.emitTableDeltas(e.Table, true)
 
 	case *messagix.Event_SocketError:
-		b.emit("USER_ALERT", fmt.Sprintf(`{"alertType":"SOCKET_ERROR","detail":%q}`, fmt.Sprintf("%v", e)))
+		b.emit("USER_ALERT", fmt.Sprintf(`{"alertType":"SOCKET_ERROR","detail":%q}`, fbLogText(fmt.Sprintf("%v", e))))
 		// A messagix socket error usually means the network moved under us, which
 		// hits the E2EE socket too. Tear E2EE down cleanly NOW (Disconnect cancels
 		// whatsmeow's auto-reconnect) so the two sockets don't both redial into an
@@ -470,7 +658,7 @@ func (b *Bridge) handleEvent(ctx context.Context, evt any) {
 		} else {
 			// Genuine permanent error (bad/expired credentials, challenge) — not
 			// fixable by waiting; Kotlin should prompt re-login.
-			b.emit("LOGGED_OUT", fmt.Sprintf(`{"reason":"permanent_error","detail":%q}`, errStr))
+			b.emit("LOGGED_OUT", fmt.Sprintf(`{"reason":"permanent_error","detail":%q}`, fbLogText(errStr)))
 		}
 
 	case *messagix.Event_Reconnected:
@@ -523,19 +711,29 @@ func (b *Bridge) emitTableDeltas(tbl *table.LSTable, live bool) {
 
 	// Correlate image/video attachments to their messages (they arrive as
 	// LSInsertBlobAttachment rows in this same delta) and stash image URLs.
-	imgByMsg, vidByMsg := b.collectAttachments(tbl)
+	partsByMsg, audByMsg := b.collectAttachments(tbl)
+	stkByMsg := b.collectStickers(tbl, partsByMsg)
 	xmaByMsg := b.collectXma(tbl)
 	ctaByMsg := b.collectCta(tbl)
 	replyByMsg := b.collectReplies(tbl)
 
 	// Harvest contact names from this delta so 1:1 DM threads (below) can be
-	// named after the other person.
+	// named after the other person, and the chat photos' addresses.
 	b.harvestContacts(tbl)
+	b.harvestAvatars(tbl)
 
 	// Capture reactions from this delta (live).
 	b.harvestReactions(tbl)
 
-	emitMsg := func(threadKey, senderId, timestampMs int64, messageId, text string) {
+	// buildMsg assembles a message payload (media + reply tagged) exactly as a live
+	// message would be, so backfilled history renders identically to live. Whether
+	// it is emitted live or captured into a backfill collector is decided by the
+	// router below, NOT here.
+	//
+	// Messenger's like button sends a thumbs-up sticker; like upstream, it's shown
+	// as a plain 👍 (which is also how it arrives in encrypted chats), not a
+	// picture.
+	buildMsg := func(threadKey, senderId, timestampMs int64, messageId, text string, stickerId int64) map[string]any {
 		// Record mid -> (thread, second, sender) so a cookie reaction on this mid
 		// can be re-keyed onto the E2EE numeric id of the same message (Task A).
 		// Recorded for every cookie message; only ones with an E2EE twin ever
@@ -544,6 +742,13 @@ func (b *Bridge) emitTableDeltas(tbl *table.LSTable, live bool) {
 			b.xlateMu.Lock()
 			b.midStamp[messageId] = msgStamp(threadKey, senderId, timestampMs)
 			b.xlateMu.Unlock()
+		}
+		stickers := stkByMsg
+		if fbIsThumbsUp(stickerId) {
+			stickers = nil
+			if strings.TrimSpace(text) == "" {
+				text = "👍"
+			}
 		}
 		payload := map[string]any{
 			"threadKey":  threadKey,
@@ -555,25 +760,102 @@ func (b *Bridge) emitTableDeltas(tbl *table.LSTable, live bool) {
 			"isMe":       senderId == b.fbid,
 			"live":       live,
 		}
-		tagMedia(payload, messageId, text, imgByMsg, vidByMsg, xmaByMsg, ctaByMsg)
+		tagMedia(payload, messageId, text, partsByMsg, audByMsg, xmaByMsg, ctaByMsg, stickers)
 		if rc, ok := replyByMsg[messageId]; ok {
 			payload["replyToId"] = rc.id
 			payload["replyToSender"] = b.lookupContact(rc.userId)
 			payload["replyToText"] = rc.text
 			payload["replyToIsMe"] = rc.userId == b.fbid
 		}
+		return payload
+	}
+
+	// routeMsg sends one message either into an active backfill collector for its
+	// thread (silently, so a history page doesn't buzz the wrist or jump the reader
+	// to newest) or emits it live. It also records the oldest (id, ts) seen per
+	// thread as a fallback history anchor for FetchMessages.
+	//
+	// An unsent message (IsUnsent) keeps its place, sender and time but loses its
+	// content: no text, media or quote, and "unsent": true, from which the phone
+	// shows Messenger's "… deleted a message" line in its place. Upstream
+	// (mautrix-meta) treats these rows the same way: never as content.
+	routeMsg := func(threadKey, senderId, timestampMs int64, messageId, text string, stickerId int64, unsent bool) {
+		if messageId != "" && timestampMs > 0 {
+			b.oldestMu.Lock()
+			cur, ok := b.oldestSeen[threadKey]
+			if !ok || timestampMs < cur.TsMs {
+				b.oldestSeen[threadKey] = fbAnchor{MsgId: messageId, TsMs: timestampMs}
+			}
+			b.oldestMu.Unlock()
+		}
+		var payload map[string]any
+		if unsent {
+			payload = map[string]any{
+				"threadKey":  threadKey,
+				"messageId":  messageId,
+				"senderId":   senderId,
+				"senderName": b.lookupContact(senderId),
+				"text":       "",
+				"timestamp":  timestampMs,
+				"isMe":       senderId == b.fbid,
+				"live":       live,
+				"unsent":     true,
+			}
+		} else {
+			payload = buildMsg(threadKey, senderId, timestampMs, messageId, text, stickerId)
+		}
+		b.bfMu.Lock()
+		bf := b.bfCollectors[threadKey]
+		b.bfMu.Unlock()
+		if bf != nil {
+			bf.add(messageId, payload)
+			return
+		}
 		b.emit("MESSAGE", payload)
 	}
 
 	// Read all three message-bearing row types (previously only LSInsertMessage).
+	// LSDeleteThenInsertMessage is how a message is unsent (IsUnsent); any other
+	// use of it still shows as the message it carries.
 	for _, m := range tbl.LSInsertMessage {
-		emitMsg(m.ThreadKey, m.SenderId, m.TimestampMs, m.MessageId, m.Text)
+		routeMsg(m.ThreadKey, m.SenderId, m.TimestampMs, m.MessageId, m.Text, m.StickerId, m.IsUnsent)
 	}
 	for _, m := range tbl.LSUpsertMessage {
-		emitMsg(m.ThreadKey, m.SenderId, m.TimestampMs, m.MessageId, m.Text)
+		routeMsg(m.ThreadKey, m.SenderId, m.TimestampMs, m.MessageId, m.Text, m.StickerId, m.IsUnsent)
 	}
 	for _, m := range tbl.LSDeleteThenInsertMessage {
-		emitMsg(m.ThreadKey, m.SenderId, m.TimestampMs, m.MessageId, m.Text)
+		routeMsg(m.ThreadKey, m.SenderId, m.TimestampMs, m.MessageId, m.Text, m.StickerId, m.IsUnsent)
+	}
+	// A message removed outright carries only its thread and id; the phone looks
+	// up the stored copy and puts the "deleted a message" line in its place.
+	for _, d := range tbl.LSDeleteMessage {
+		if d != nil && d.MessageId != "" {
+			b.emit("UNSEND", map[string]any{"threadKey": d.ThreadKey, "messageId": d.MessageId})
+		}
+	}
+
+	// History-page pagination ranges. A FetchMessagesTask response carries an
+	// LSInsertNewMessageRange giving the next-older anchor (MinMessageId/
+	// MinTimestampMs) and whether the top of the thread is reached (HasMoreBefore).
+	// When a collector is active for the thread, feed the range to it — this is
+	// what drives paging and exhaustion in FetchMessages.
+	for _, r := range tbl.LSInsertNewMessageRange {
+		b.bfMu.Lock()
+		bf := b.bfCollectors[r.ThreadKey]
+		b.bfMu.Unlock()
+		if bf != nil {
+			bf.applyRange(r.MinMessageId, r.MinTimestampMs, r.HasMoreBefore)
+		}
+	}
+	// An "update existing range" for a collecting thread means the server has no
+	// more history before our anchor — treat it as top-of-thread.
+	for _, r := range tbl.LSUpdateExistingMessageRange {
+		b.bfMu.Lock()
+		bf := b.bfCollectors[r.ThreadKey]
+		b.bfMu.Unlock()
+		if bf != nil {
+			bf.applyRange("", 0, false)
+		}
 	}
 
 	// Thread upserts (conversation list).
@@ -643,6 +925,623 @@ func (b *Bridge) lookupContact(id int64) string {
 	return b.contactNames[id]
 }
 
+// ---- Chat photos ------------------------------------------------------------
+//
+// The phone shows each chat's photo on the watch's chat list and in its own
+// notifications. A 1:1 chat shows the other person's profile picture: its
+// thread key is that person's id, for an encrypted chat too. A group shows its
+// own picture, only one it was given: a group without one keeps its letter,
+// never one member's face. The addresses come in the same contact and thread
+// rows as the names, in every sync. They're signed and lapse, so the phone gets
+// an id naming the picture (AvatarKey) and the download uses whatever address
+// the bridge holds for it at that moment (DownloadAvatar).
+
+// fbPicURL is one address of a picture and when it lapses (unix ms, 0 = not
+// said).
+type fbPicURL struct {
+	URL string
+	Exp int64
+}
+
+// fbContactPic is a person's profile picture: the address every contact row
+// carries, and the larger one a full contact row adds. Both show the same
+// picture.
+type fbContactPic struct {
+	Small, Large fbPicURL
+}
+
+// name is the picture's own name, from the address every row carries.
+func (p fbContactPic) name() string {
+	if n := fbAvatarName(p.Small.URL); n != "" {
+		return n
+	}
+	return fbAvatarName(p.Large.URL)
+}
+
+// fbAvatarName is the file name in a picture's address. It's the picture's own
+// id: the same in the re-signed addresses each sync brings, different when the
+// picture changes (mautrix-meta keys avatars on it too).
+func fbAvatarName(u string) string {
+	if u == "" {
+		return ""
+	}
+	p, err := url.Parse(u)
+	if err != nil {
+		return ""
+	}
+	n := path.Base(p.Path)
+	if n == "." || n == "/" {
+		return ""
+	}
+	return n
+}
+
+// fbPic builds an fbPicURL from a row's address, fallback address and expiry.
+// An expiry too small to be in milliseconds is treated as not said.
+func fbPic(u, fallback string, exp int64) fbPicURL {
+	if u == "" {
+		u = fallback
+	}
+	if exp < 1e12 {
+		exp = 0
+	}
+	return fbPicURL{URL: u, Exp: exp}
+}
+
+// harvestAvatars records the picture addresses in this delta: people's from the
+// contact rows, groups' own from the thread rows. A person's address with a new
+// file name is a new picture, so the large address kept for the old one goes. A
+// group whose row says it has no picture of its own is dropped. Logs the counts
+// (structural only) when they change.
+func (b *Bridge) harvestAvatars(tbl *table.LSTable) {
+	if tbl == nil {
+		return
+	}
+	b.avatarMu.Lock()
+	if b.contactPic == nil {
+		b.contactPic = make(map[int64]fbContactPic)
+	}
+	if b.threadPic == nil {
+		b.threadPic = make(map[int64]fbPicURL)
+	}
+	if b.plainGroups == nil {
+		b.plainGroups = make(map[int64]struct{})
+	}
+	for _, c := range tbl.LSVerifyContactRowExists {
+		if c == nil || c.ContactId == 0 {
+			continue
+		}
+		small := fbPic(c.ProfilePictureUrl, c.ProfilePictureFallbackUrl, c.ProfilePictureUrlExpirationTimestampMs)
+		if small.URL == "" {
+			continue
+		}
+		p := b.contactPic[c.ContactId]
+		if p.Small.URL != "" && fbAvatarName(p.Small.URL) != fbAvatarName(small.URL) {
+			p = fbContactPic{}
+		}
+		p.Small = small
+		b.contactPic[c.ContactId] = p
+	}
+	for _, c := range tbl.LSDeleteThenInsertContact {
+		if c == nil || c.Id == 0 {
+			continue
+		}
+		p := fbContactPic{
+			Small: fbPic(c.ProfilePictureUrl, c.ProfilePictureFallbackUrl, c.ProfilePictureUrlExpirationTimestampMs),
+			Large: fbPic(c.ProfilePictureLargeUrl, c.ProfilePictureLargeFallbackUrl, c.ProfilePictureLargeUrlExpirationTimestampMs),
+		}
+		if p.Small.URL != "" || p.Large.URL != "" {
+			b.contactPic[c.Id] = p
+		}
+	}
+	group := func(key int64, pic fbPicURL, own bool) {
+		switch {
+		case key == 0:
+		case own && pic.URL != "":
+			b.threadPic[key] = pic
+			delete(b.plainGroups, key)
+		default:
+			delete(b.threadPic, key)
+			if pic.URL != "" {
+				b.plainGroups[key] = struct{}{}
+			} else {
+				delete(b.plainGroups, key)
+			}
+		}
+	}
+	for _, t := range tbl.LSDeleteThenInsertThread {
+		if t != nil && !t.ThreadType.IsOneToOne() {
+			group(t.ThreadKey, fbPic(t.ThreadPictureUrl, t.ThreadPictureUrlFallback, t.ThreadPictureUrlExpirationTimestampMs), t.IsCustomThreadPicture)
+		}
+	}
+	for _, t := range tbl.LSUpdateOrInsertThread {
+		if t != nil && !t.ThreadType.IsOneToOne() {
+			group(t.ThreadKey, fbPic(t.ThreadPictureUrl, t.ThreadPictureUrlFallback, t.ThreadPictureUrlExpirationTimestampMs), t.IsCustomThreadPicture)
+		}
+	}
+	// A picture change. This row doesn't say the thread's type; a 1:1 chat's key
+	// is the other person's id, so a known person's isn't a group.
+	for _, s := range tbl.LSSetThreadImageURL {
+		if s == nil {
+			continue
+		}
+		if _, person := b.contactPic[s.ThreadKey]; person {
+			continue
+		}
+		group(s.ThreadKey, fbPic(s.ImageURL, s.ImageFallbackURL, s.ImageURLExpiryTimeMS), s.IsCustomThreadPicture)
+	}
+	counts := [3]int{len(b.contactPic), len(b.threadPic), len(b.plainGroups)}
+	changed := counts != b.avatarCounts
+	b.avatarCounts = counts
+	b.avatarMu.Unlock()
+	if changed {
+		b.emit("DIAG", fmt.Sprintf(`{"avatars":"known","people":%d,"groups":%d,"groupsWithoutOwn":%d}`,
+			counts[0], counts[1], counts[2]))
+	}
+}
+
+// avatarDiag emits a DIAG line about one chat's photo (structural only: the
+// thread key and a reason, never an address).
+func (b *Bridge) avatarDiag(reason string, threadKey int64, detail string) {
+	out, _ := json.Marshal(map[string]any{"avatars": reason, "thread": threadKey, "detail": detail})
+	b.emit("DIAG", string(out))
+}
+
+// AvatarKey names the photo of the chat with this thread key, for the phone's
+// avatarId: "<threadKey>|<the picture's file name>", which changes when the
+// picture does. "" when there's none (the chat keeps its letter). It only reads
+// what the bridge holds, no network, so the phone can ask for every row of the
+// chat list.
+func (b *Bridge) AvatarKey(threadKey string) string {
+	tk, err := strconv.ParseInt(threadKey, 10, 64)
+	if err != nil || tk <= 0 {
+		return ""
+	}
+	b.avatarMu.Lock()
+	defer b.avatarMu.Unlock()
+	if p, ok := b.threadPic[tk]; ok {
+		if n := fbAvatarName(p.URL); n != "" {
+			return threadKey + "|" + n
+		}
+	}
+	if n := b.contactPic[tk].name(); n != "" {
+		return threadKey + "|" + n
+	}
+	return ""
+}
+
+// avatarURLs lists the addresses to try for a chat's photo, best first: a
+// group's own picture, else the person's large then small address, the ones not
+// known to have lapsed before the ones that have. fresh says one hasn't lapsed;
+// group says it's a group's picture.
+func (b *Bridge) avatarURLs(tk int64) (urls []string, fresh, group bool) {
+	soon := time.Now().UnixMilli() + 30_000
+	b.avatarMu.Lock()
+	var cands []fbPicURL
+	if p, ok := b.threadPic[tk]; ok {
+		cands, group = []fbPicURL{p}, true
+	} else if p, ok := b.contactPic[tk]; ok {
+		cands = []fbPicURL{p.Large, p.Small}
+	}
+	b.avatarMu.Unlock()
+	var lapsed []string
+	for _, c := range cands {
+		switch {
+		case c.URL == "":
+		case c.Exp > 0 && c.Exp <= soon:
+			lapsed = append(lapsed, c.URL)
+		default:
+			urls = append(urls, c.URL)
+			fresh = true
+		}
+	}
+	return append(urls, lapsed...), fresh, group
+}
+
+// Why an address didn't give a picture, from least to most worth trying again.
+const (
+	fbAvGone    = iota // 404 or 410, over the size cap, a picture type the phone can't read
+	fbAvRefused        // 403: how the CDN answers an address whose signature lapsed
+	fbAvError          // anything else (offline, timeout, an error page): may work later
+)
+
+// fbAvatarMax is the biggest picture taken (Avatars.httpGet's cap).
+const fbAvatarMax = 4 << 20
+
+var fbAvatarClient = &http.Client{Timeout: 30 * time.Second}
+
+// fbAvatarGet downloads one picture address. The error text is what the phone
+// logs: a status or a reason, never the address.
+func fbAvatarGet(ctx context.Context, u string) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fbAvError, errors.New("bad picture address")
+	}
+	fbVideoHeaders(req.Header, "image")
+	req.Header.Set("Accept", "image/webp,image/jpeg,image/png,*/*;q=0.5")
+	resp, err := fbAvatarClient.Do(req)
+	if err != nil {
+		return nil, fbAvError, errors.New(fbDiagErr(err))
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound, http.StatusGone:
+		return nil, fbAvGone, fmt.Errorf("status %d", resp.StatusCode)
+	case http.StatusForbidden:
+		return nil, fbAvRefused, errors.New("status 403, the address has lapsed")
+	default:
+		return nil, fbAvError, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, fbAvatarMax+1))
+	if err != nil {
+		return nil, fbAvError, errors.New(fbDiagErr(err))
+	}
+	if len(data) > fbAvatarMax {
+		return nil, fbAvGone, errors.New("over 4 MB")
+	}
+	if fbIsPicture(data) {
+		return data, 0, nil
+	}
+	ct := strings.TrimSpace(strings.SplitN(resp.Header.Get("Content-Type"), ";", 2)[0])
+	if len(ct) > 40 {
+		ct = ct[:40]
+	}
+	if strings.HasPrefix(ct, "image/") {
+		return nil, fbAvGone, errors.New("unreadable picture type " + ct)
+	}
+	if ct == "" {
+		ct = "no type"
+	}
+	return nil, fbAvError, errors.New("not a picture (" + ct + ")")
+}
+
+// fbIsPicture reports whether data is a JPEG, PNG, WebP or GIF.
+func fbIsPicture(data []byte) bool {
+	return bytes.HasPrefix(data, []byte{0xFF, 0xD8, 0xFF}) ||
+		bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) ||
+		bytes.HasPrefix(data, []byte("GIF8")) ||
+		fbIsWebP(data)
+}
+
+// fetchAvatar tries each address in turn and returns the first picture, or why
+// none came (the reason most worth trying again, with its error).
+func (b *Bridge) fetchAvatar(urls []string) ([]byte, int, error) {
+	why, err := fbAvError, error(errors.New("no picture address"))
+	for i, u := range urls {
+		data, w, e := fbAvatarGet(b.ctx, u)
+		if e == nil {
+			return data, 0, nil
+		}
+		if i == 0 || w > why {
+			why, err = w, e
+		}
+	}
+	return nil, why, err
+}
+
+// refreshContact asks Messenger for a person's full contact row (the task
+// mautrix-meta fills in an unknown person with) and takes their name and
+// picture addresses from it. At most once per person every 10 minutes. found
+// says the answer had a row for them.
+func (b *Bridge) refreshContact(id int64) (found bool, err error) {
+	now := time.Now().UnixMilli()
+	b.avatarMu.Lock()
+	if b.avatarAsked == nil {
+		b.avatarAsked = make(map[int64]int64)
+	}
+	if last := b.avatarAsked[id]; last > 0 && now-last < 10*60*1000 {
+		b.avatarMu.Unlock()
+		return false, errors.New("asked Messenger a moment ago")
+	}
+	b.avatarAsked[id] = now
+	b.avatarMu.Unlock()
+
+	b.mu.Lock()
+	client := b.client
+	b.mu.Unlock()
+	if client == nil {
+		return false, errors.New("Messenger isn't connected")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			found, err = false, fmt.Errorf("contact lookup failed: %v", r)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
+	defer cancel()
+	if werr := client.WaitUntilCanSendMessages(ctx, 10*time.Second); werr != nil {
+		return false, errors.New("Messenger isn't connected")
+	}
+	resp, xerr := client.ExecuteTasks(ctx, &socket.GetContactsFullTask{ContactID: id})
+	if xerr != nil {
+		return false, errors.New("contact lookup: " + fbDiagErr(xerr))
+	}
+	if resp == nil {
+		return false, nil
+	}
+	b.harvestContacts(resp)
+	b.harvestAvatars(resp)
+	for _, c := range resp.LSDeleteThenInsertContact {
+		if c != nil && c.Id == id {
+			found = true
+		}
+	}
+	for _, c := range resp.LSVerifyContactRowExists {
+		if c != nil && c.ContactId == id {
+			found = true
+		}
+	}
+	return found, nil
+}
+
+// DownloadAvatar downloads the photo AvatarKey names for this thread key, for
+// the phone's avatarBytes: the picture as it is now. (nil, nil), no photo, only
+// when there's none to have: the CDN says it's gone, it's unusable, or the
+// person's own row has no picture. Anything that may work later is an error,
+// which the phone tries again in 2 minutes: offline, a timeout, an error page,
+// no address yet. A person's address that has lapsed, or that the CDN refuses
+// (403), is asked for again from Messenger once. Errors never carry an address.
+func (b *Bridge) DownloadAvatar(threadKey string) ([]byte, error) {
+	tk, err := strconv.ParseInt(threadKey, 10, 64)
+	if err != nil || tk <= 0 {
+		return nil, errors.New("not a Messenger chat")
+	}
+	urls, fresh, group := b.avatarURLs(tk)
+	asked := false
+	if !group && !fresh {
+		// A person whose address isn't known (yet) or has lapsed: ask for their row.
+		asked = true
+		found, rerr := b.refreshContact(tk)
+		if rerr == nil {
+			urls, _, group = b.avatarURLs(tk)
+			if len(urls) == 0 && found {
+				b.avatarDiag("none", tk, "no picture on their row")
+				return nil, nil
+			}
+		}
+		if len(urls) == 0 {
+			if rerr == nil {
+				rerr = errors.New("Messenger sent no row for them")
+			}
+			return nil, errors.New("no picture address yet (" + rerr.Error() + ")")
+		}
+	}
+	data, why, err := b.fetchAvatar(urls)
+	if data == nil && why == fbAvRefused && !group && !asked {
+		// 403 is how a lapsed address is answered: ask for a new one, once.
+		if _, rerr := b.refreshContact(tk); rerr == nil {
+			if again, _, _ := b.avatarURLs(tk); len(again) > 0 {
+				data, why, err = b.fetchAvatar(again)
+			}
+		}
+	}
+	if data != nil {
+		return data, nil
+	}
+	if why == fbAvGone {
+		b.avatarDiag("none", tk, err.Error())
+		return nil, nil
+	}
+	return nil, err
+}
+
+// ---- Facebook link pages ------------------------------------------------------
+//
+// The phone reads a Facebook link (reel, video, photo, post) sent in any chat as
+// the logged-in session, so friends-only and group posts show too. The bridge
+// only GETs the page; the phone parses it. Read-only: one document request per
+// hop, nothing the page references is fetched, the socket isn't touched.
+
+// fbPageMaxHops is how many redirects a page read follows.
+const fbPageMaxHops = 5
+
+// fbPageMaxBody caps what a page read returns, whatever the phone asks for.
+const fbPageMaxBody = 8 << 20
+
+// fbPageGap and fbPagePerHour pace page reads: one at a time, at least 3 s
+// apart, at most 30 an hour.
+const (
+	fbPageGap     = 3 * time.Second
+	fbPagePerHour = 30
+)
+
+var (
+	fbPageMu    sync.Mutex // held for a whole read: one in flight
+	fbPageLast  time.Time
+	fbPageTimes []time.Time
+)
+
+var fbPageClient = &http.Client{
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+// fbPageHost says whether a page read may go to host, and whether the
+// session's cookies go with it (facebook.com only: a browser doesn't send them
+// to fb.watch).
+func fbPageHost(host string) (allowed, cookies bool) {
+	switch strings.ToLower(host) {
+	case "facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com":
+		return true, true
+	case "fb.watch", "www.fb.watch":
+		return true, false
+	}
+	return false, false
+}
+
+// fbPageStop is a redirect target that means the session can't read pages
+// (logged out, a checkpoint): returned as is, never fetched.
+func fbPageStop(u *url.URL) bool {
+	p := strings.ToLower(u.Path)
+	return strings.HasPrefix(p, "/checkpoint") || strings.HasPrefix(p, "/login") ||
+		p == "/challenge/" || strings.HasPrefix(p, "/accounts/suspended") ||
+		strings.HasPrefix(p, "/privacy/consent")
+}
+
+// fbPageShape is a path with everything but Facebook's own words starred out,
+// for the diag line (no ids, page names or query).
+func fbPageShape(p string) string {
+	keep := map[string]bool{
+		"reel": true, "reels": true, "share": true, "v": true, "r": true, "p": true,
+		"watch": true, "videos": true, "photo": true, "photo.php": true, "photos": true,
+		"posts": true, "permalink.php": true, "story.php": true, "groups": true,
+		"permalink": true, "checkpoint": true, "login": true, "login.php": true, "video.php": true,
+	}
+	segs := strings.Split(strings.Trim(p, "/"), "/")
+	for i, s := range segs {
+		if s != "" && !keep[strings.ToLower(s)] {
+			segs[i] = "*"
+		}
+	}
+	return "/" + strings.Join(segs, "/")
+}
+
+// fbPageHeaders are the headers messagix sends when it loads the messages page
+// as a document (its buildHeaders(withCookies, isSecFetchDocument)).
+func fbPageHeaders(ck *cookies.Cookies, withCookies bool) http.Header {
+	h := http.Header{}
+	h.Set("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+	h.Set("accept-language", "en-US,en;q=0.9")
+	h.Set("dpr", useragent.DPR)
+	h.Set("user-agent", useragent.UserAgent)
+	h.Set("sec-ch-ua", useragent.SecCHUserAgent)
+	h.Set("sec-ch-ua-platform", useragent.SecCHPlatform)
+	h.Set("sec-ch-prefers-color-scheme", useragent.SecCHPrefersColorScheme)
+	h.Set("sec-ch-ua-full-version-list", useragent.SecCHFullVersionList)
+	h.Set("sec-ch-ua-mobile", useragent.SecCHMobile)
+	h.Set("sec-ch-ua-model", useragent.SecCHModel)
+	h.Set("sec-ch-ua-platform-version", useragent.SecCHPlatformVersion)
+	h.Set("sec-fetch-dest", "document")
+	h.Set("sec-fetch-mode", "navigate")
+	h.Set("sec-fetch-site", "none")
+	h.Set("sec-fetch-user", "?1")
+	h.Set("upgrade-insecure-requests", "1")
+	if withCookies && ck != nil {
+		if s := ck.String(); s != "" {
+			h.Set("cookie", s)
+		}
+		w, _ := ck.GetViewports()
+		h.Set("viewport-width", w)
+		h.Set("x-asbd-id", "129477")
+	}
+	return h
+}
+
+// fbPageJSON is FetchPage's answer.
+func fbPageJSON(v map[string]any) string {
+	out, _ := json.Marshal(v)
+	return string(out)
+}
+
+// FetchPage GETs a facebook.com (or fb.watch) page as the logged-in session,
+// following up to 5 redirects under the same host rule, and returns
+// {"status":N,"url":"<final url>","body":"<html, at most maxBytes>"} or
+// {"error":"..."} (not logged in, refused host, rate, network). A redirect to a
+// checkpoint or login page comes back as its address with no body. Blocking.
+// Logs status, host, path shape and length only.
+func (b *Bridge) FetchPage(pageURL string, maxBytes int64) (string, error) {
+	if b.platform == types.Instagram {
+		return fbPageJSON(map[string]any{"error": "not facebook"}), nil
+	}
+	b.mu.Lock()
+	client := b.client
+	b.mu.Unlock()
+	if client == nil || client.GetCookies() == nil || !client.GetCookies().IsLoggedIn() {
+		return fbPageJSON(map[string]any{"error": "not logged in"}), nil
+	}
+	ck := client.GetCookies()
+	u, err := url.Parse(pageURL)
+	if err != nil || u.Scheme != "https" {
+		return fbPageJSON(map[string]any{"error": "refused host"}), nil
+	}
+	if ok, _ := fbPageHost(u.Hostname()); !ok {
+		return fbPageJSON(map[string]any{"error": "refused host"}), nil
+	}
+	if maxBytes <= 0 || maxBytes > fbPageMaxBody {
+		maxBytes = fbPageMaxBody
+	}
+
+	fbPageMu.Lock()
+	defer fbPageMu.Unlock()
+	now := time.Now()
+	kept := fbPageTimes[:0]
+	for _, t := range fbPageTimes {
+		if now.Sub(t) < time.Hour {
+			kept = append(kept, t)
+		}
+	}
+	fbPageTimes = kept
+	if len(fbPageTimes) >= fbPagePerHour {
+		b.emit("DIAG", fbPageJSON(map[string]any{"page": "rate", "lastHour": len(fbPageTimes)}))
+		return fbPageJSON(map[string]any{"error": "rate"}), nil
+	}
+	if wait := fbPageGap - now.Sub(fbPageLast); wait > 0 {
+		select {
+		case <-time.After(wait):
+		case <-b.ctx.Done():
+			return fbPageJSON(map[string]any{"error": "bridge stopped"}), nil
+		}
+	}
+	defer func() { fbPageLast = time.Now() }()
+	fbPageTimes = append(fbPageTimes, time.Now())
+
+	diag := func(status, hops int, at *url.URL, n int, note string) {
+		d := map[string]any{"page": status, "hops": hops, "host": at.Hostname(), "path": fbPageShape(at.Path), "len": n}
+		if note != "" {
+			d["note"] = note
+		}
+		b.emit("DIAG", fbPageJSON(d))
+	}
+	for hop := 0; ; hop++ {
+		_, withCookies := fbPageHost(u.Hostname())
+		req, rerr := http.NewRequestWithContext(b.ctx, http.MethodGet, u.String(), nil)
+		if rerr != nil {
+			return fbPageJSON(map[string]any{"error": "bad address"}), nil
+		}
+		req.Header = fbPageHeaders(ck, withCookies)
+		resp, derr := fbPageClient.Do(req)
+		if derr != nil {
+			msg := fbDiagErr(derr)
+			diag(0, hop, u, 0, msg)
+			return fbPageJSON(map[string]any{"error": "network: " + msg}), nil
+		}
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.Header.Get("Location") != "" {
+			next, lerr := resp.Location()
+			resp.Body.Close()
+			if lerr != nil {
+				diag(resp.StatusCode, hop, u, 0, "bad redirect")
+				return fbPageJSON(map[string]any{"error": "bad redirect"}), nil
+			}
+			if ok, _ := fbPageHost(next.Hostname()); !ok || next.Scheme != "https" {
+				diag(resp.StatusCode, hop, u, 0, "redirect off facebook")
+				return fbPageJSON(map[string]any{"error": "refused host"}), nil
+			}
+			if fbPageStop(next) {
+				diag(resp.StatusCode, hop+1, next, 0, "")
+				return fbPageJSON(map[string]any{"status": resp.StatusCode, "url": next.String(), "body": ""}), nil
+			}
+			if hop+1 > fbPageMaxHops {
+				diag(resp.StatusCode, hop, u, 0, "too many redirects")
+				return fbPageJSON(map[string]any{"error": "too many redirects"}), nil
+			}
+			u = next
+			continue
+		}
+		body, berr := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
+		resp.Body.Close()
+		if berr != nil {
+			msg := fbDiagErr(berr)
+			diag(resp.StatusCode, hop, u, len(body), msg)
+			return fbPageJSON(map[string]any{"error": "network: " + msg}), nil
+		}
+		diag(resp.StatusCode, hop, u, len(body), "")
+		return fbPageJSON(map[string]any{"status": resp.StatusCode, "url": u.String(), "body": string(body)}), nil
+	}
+}
+
 // harvestReactions records per-message reactions from this delta. LSUpsertReaction
 // adds or changes an actor's reaction (an empty Reaction string means the actor
 // cleared it); LSDeleteReaction removes an actor's reaction. Both are keyed by
@@ -704,7 +1603,7 @@ func (b *Bridge) harvestReactions(tbl *table.LSTable) {
 		return
 	}
 	// Record this delta's message stamps up front, so a reaction arriving in the
-	// same delta as its message can be stamped for the snapshot below (emitMsg,
+	// same delta as its message can be stamped for the snapshot below (buildMsg,
 	// which also records these, runs later). Idempotent with that later pass.
 	recordStamp := func(threadKey, senderId, timestampMs int64, mid string) {
 		if mid == "" {
@@ -835,23 +1734,106 @@ func (b *Bridge) harvestReactions(tbl *table.LSTable) {
 	}
 }
 
-// collectAttachments scans the blob-attachment rows, stashes image URLs (keyed by
-// messageId) for on-demand download, and returns per-message image/video maps so
-// the caller can tag the emitted messages. A FBIMG diagnostic confirms capture.
-func (b *Bridge) collectAttachments(tbl *table.LSTable) (map[string]fbImg, map[string]bool) {
-	imgByMsg := map[string]fbImg{}
-	vidByMsg := map[string]bool{}
+// fbPart is one picture or video of a message, in attachment order. Key is the
+// id the phone asks for it by (fbPartKey).
+type fbPart struct {
+	Key string
+	Img *fbImg
+	Vid *fbVid
+}
+
+// fbPartKey is the download key of a message's i-th picture or video: the
+// message id for the first (so a lone picture or video keeps the id it always
+// had), the message id + "#i" for the ones after it.
+func fbPartKey(messageId string, i int) string {
+	if i == 0 {
+		return messageId
+	}
+	return messageId + "#" + strconv.Itoa(i)
+}
+
+// collectAttachments correlates this delta's blob attachments with their
+// messages: every picture and video of a message, in order (an album when there
+// are several), and its audio. Their download info is stored under each part's
+// key for the image and video downloads.
+//
+// Order is the attachments' AttachmentIndex (a stable sort, so rows without one
+// keep the table's order). Messenger sometimes sends the same attachment twice,
+// byte for byte; like upstream, a repeated AttachmentFbid is skipped (the same
+// picture attached twice has two fbids).
+func (b *Bridge) collectAttachments(tbl *table.LSTable) (map[string][]fbPart, map[string]fbAud) {
+	partsByMsg := map[string][]fbPart{}
+	audByMsg := map[string]fbAud{}
+	atts := make([]*table.LSInsertBlobAttachment, 0, len(tbl.LSInsertBlobAttachment))
 	for _, att := range tbl.LSInsertBlobAttachment {
-		if att == nil || att.MessageId == "" {
+		if att != nil && att.MessageId != "" {
+			atts = append(atts, att)
+		}
+	}
+	sort.SliceStable(atts, func(i, j int) bool { return atts[i].AttachmentIndex < atts[j].AttachmentIndex })
+	seen := map[string]bool{}
+	for _, att := range atts {
+		dup := att.AttachmentFbid
+		if dup == "" {
+			dup = att.PlayableUrl + "\x00" + att.PreviewUrl
+		}
+		if k := att.MessageId + "\x00" + dup; seen[k] {
 			continue
+		} else {
+			seen[k] = true
 		}
 		switch {
-		case isFbVideoAtt(att):
-			vidByMsg[att.MessageId] = true
-		case isFbImageAtt(att):
-			if _, ok := imgByMsg[att.MessageId]; ok {
-				continue // first image per message wins
+		case isFbAudioAtt(att):
+			// Checked first: a voice message's file is an mp4, which must not make
+			// it a video.
+			if _, ok := audByMsg[att.MessageId]; ok {
+				continue // first audio per message wins
 			}
+			a := fbAud{
+				URL:      att.PlayableUrl,
+				Fallback: att.PlayableUrlFallback,
+				Mime:     att.PlayableUrlMimeType,
+				Size:     att.Filesize,
+				Voice:    att.AttachmentType == table.AttachmentTypeAudio,
+			}
+			if a.URL == "" {
+				a.URL, a.Fallback = a.Fallback, ""
+			}
+			if !strings.HasPrefix(a.Mime, "audio/") {
+				a.Mime = att.AttachmentMimeType
+			}
+			if !strings.HasPrefix(a.Mime, "audio/") {
+				a.Mime = "audio/mp4"
+			}
+			audByMsg[att.MessageId] = a
+		case isFbVideoAtt(att):
+			v := fbVid{
+				URL:      att.PlayableUrl,
+				Fallback: att.PlayableUrlFallback,
+				Mime:     att.PlayableUrlMimeType,
+				Size:     att.Filesize,
+				Poster:   att.PreviewUrlLarge,
+				PosterMT: att.PreviewUrlMimeType,
+				GifLike:  att.AttachmentType == table.AttachmentTypeAnimatedImage,
+			}
+			if v.URL == "" {
+				v.URL, v.Fallback = v.Fallback, ""
+			}
+			if v.Mime == "" {
+				v.Mime = att.AttachmentMimeType
+			}
+			if !strings.HasPrefix(v.Mime, "video/") {
+				v.Mime = "video/mp4"
+			}
+			if v.Poster == "" {
+				v.Poster = att.PreviewUrl
+			}
+			if v.PosterMT == "" || !strings.HasPrefix(v.PosterMT, "image/") {
+				v.PosterMT = "image/jpeg"
+			}
+			key := fbPartKey(att.MessageId, len(partsByMsg[att.MessageId]))
+			partsByMsg[att.MessageId] = append(partsByMsg[att.MessageId], fbPart{Key: key, Vid: &v})
+		case isFbImageAtt(att):
 			url := att.PreviewUrlLarge
 			if url == "" {
 				url = att.PreviewUrl
@@ -866,72 +1848,417 @@ func (b *Bridge) collectAttachments(tbl *table.LSTable) (map[string]fbImg, map[s
 			if mime == "" {
 				mime = "image/jpeg"
 			}
-			imgByMsg[att.MessageId] = fbImg{URL: url, Mime: mime}
+			key := fbPartKey(att.MessageId, len(partsByMsg[att.MessageId]))
+			partsByMsg[att.MessageId] = append(partsByMsg[att.MessageId], fbPart{Key: key, Img: &fbImg{URL: url, Mime: mime}})
 		}
 	}
-	if len(imgByMsg) > 0 {
+	if len(partsByMsg) > 0 {
 		b.imgMu.Lock()
-		for mid, im := range imgByMsg {
-			b.imgURLs[mid] = im
+		for _, parts := range partsByMsg {
+			for _, p := range parts {
+				switch {
+				case p.Img != nil:
+					b.imgURLs[p.Key] = *p.Img
+				case p.Vid != nil:
+					if p.Vid.URL != "" {
+						b.vidURLs[p.Key] = *p.Vid
+					}
+					if p.Vid.Poster != "" && !p.Vid.GifLike {
+						b.imgURLs[fbPosterKey(p.Key)] = fbImg{URL: p.Vid.Poster, Mime: p.Vid.PosterMT}
+					}
+				}
+			}
 		}
 		b.imgMu.Unlock()
-		for mid, im := range imgByMsg {
-			b.emit("FBIMG", fmt.Sprintf(`{"msg":%q,"mime":%q,"hasURL":%t}`, mid, im.Mime, im.URL != ""))
+		for _, parts := range partsByMsg {
+			for _, p := range parts {
+				if p.Img != nil {
+					b.emit("FBIMG", fmt.Sprintf(`{"msg":%q,"mime":%q,"hasURL":%t}`, p.Key, p.Img.Mime, p.Img.URL != ""))
+				} else {
+					v := p.Vid
+					b.emit("FBVID", fmt.Sprintf(`{"msg":%q,"mime":%q,"hasURL":%t,"hasPoster":%t,"gif":%t,"size":%d}`,
+						p.Key, v.Mime, v.URL != "", v.Poster != "", v.GifLike, v.Size))
+				}
+			}
 		}
 	}
-	return imgByMsg, vidByMsg
+	if len(audByMsg) > 0 {
+		b.imgMu.Lock()
+		for mid, a := range audByMsg {
+			if a.URL != "" {
+				b.audURLs[mid] = a
+			}
+		}
+		b.imgMu.Unlock()
+		for mid, a := range audByMsg {
+			b.emit("FBAUD", fmt.Sprintf(`{"msg":%q,"mime":%q,"hasURL":%t,"voice":%t,"size":%d}`,
+				mid, a.Mime, a.URL != "", a.Voice, a.Size))
+		}
+	}
+	return partsByMsg, audByMsg
 }
 
-// tagMedia adds image mediaContent to a message payload, or substitutes a
+// fbPosterKey is the image-download key a video's poster is stored under. The
+// phone passes it back to DownloadImageForWatch as posterMediaID.
+func fbPosterKey(messageId string) string { return "p:" + messageId }
+
+// fbVideoKey is the retention key for a video's E2EE media transport, shared
+// with the image transport store (image keys are bare message ids).
+func fbVideoKey(messageId string) string { return "v:" + messageId }
+
+// fbAudioKey is the retention key for an audio message's E2EE media transport,
+// beside the video ones.
+func fbAudioKey(messageId string) string { return "a:" + messageId }
+
+// fbStickerKey is the retention key for a sticker's E2EE media transport, in the
+// image transport store. The phone asks for it by bare message id, like any
+// picture; the key's prefix is what marks it a sticker (even after a restart).
+func fbStickerKey(messageId string) string { return "s:" + messageId }
+
+// fbVideoImageKey is the retention key for a picture Messenger sent inside an
+// E2EE video message (its GIFs), in the image transport store. Asked for by bare
+// message id like any picture; the prefix says to decrypt it with video keys.
+func fbVideoImageKey(messageId string) string { return "vi:" + messageId }
+
+// Messenger's like button: a thumbs-up sticker in three sizes.
+const (
+	fbThumbsUpSmall  = 369239263222822
+	fbThumbsUpMedium = 369239343222814
+	fbThumbsUpLarge  = 369239383222810
+)
+
+func fbIsThumbsUp(stickerId int64) bool {
+	return stickerId == fbThumbsUpSmall || stickerId == fbThumbsUpMedium || stickerId == fbThumbsUpLarge
+}
+
+// collectStickers scans sticker attachments and stores each one's picture like an
+// image, flagged as a sticker, so the watch asks for it by message id the same
+// way. The animated version (PlayableUrl) is preferred, as upstream does; a GIF
+// one plays, a WebP one shows its first frame. A message that already carries a
+// photo or video in this delta keeps that instead.
+func (b *Bridge) collectStickers(tbl *table.LSTable, partsByMsg map[string][]fbPart) map[string]fbImg {
+	out := map[string]fbImg{}
+	for _, s := range tbl.LSInsertStickerAttachment {
+		if s == nil || s.MessageId == "" {
+			continue
+		}
+		if _, ok := out[s.MessageId]; ok {
+			continue // first sticker per message wins
+		}
+		if len(partsByMsg[s.MessageId]) > 0 {
+			continue
+		}
+		url, mime := s.PlayableUrl, s.PlayableUrlMimeType
+		if url == "" || strings.HasPrefix(mime, "video/") {
+			url, mime = s.PreviewUrl, s.PreviewUrlMimeType
+		}
+		if url == "" {
+			url, mime = s.ImageUrl, s.ImageUrlMimeType
+		}
+		if url == "" {
+			continue
+		}
+		if !strings.HasPrefix(mime, "image/") {
+			mime = "image/png"
+		}
+		out[s.MessageId] = fbImg{URL: url, Mime: mime, Sticker: true}
+	}
+	if len(out) > 0 {
+		b.imgMu.Lock()
+		for mid, st := range out {
+			b.imgURLs[mid] = st
+		}
+		b.imgMu.Unlock()
+		for mid, st := range out {
+			b.emit("FBSTK", fmt.Sprintf(`{"msg":%q,"mime":%q}`, mid, st.Mime))
+		}
+	}
+	return out
+}
+
+// tagMedia adds the media markers to a message payload, or substitutes a
 // content-type label when the message has no text of its own. Shares (XMA) take
 // priority: a shared link / video / post must not be mistaken for a standalone
 // photo just because it carries a preview thumbnail.
-func tagMedia(payload map[string]any, messageId, text string, imgByMsg map[string]fbImg, vidByMsg map[string]bool, xmaByMsg map[string]string, ctaByMsg map[string]bool) {
-	if label, ok := xmaByMsg[messageId]; ok {
-		// Rich share card (link preview, shared post, etc.). These arrive as XMA and
-		// usually carry their own description as the message text. Mark it "[Link]" so
-		// the watch shows it as a link and replies quote it as one, keeping whatever
-		// context we have beneath: the user's text, else the share's title/url.
-		body := strings.TrimSpace(text)
-		if body == "" && label != "[link]" {
-			body = label
+//
+// Pictures and videos: a lone one sets imageMime / videoMime (mediaID = the
+// message id), as always. Several make an album: "media" lists them in order,
+// each with its own id (fbPartKey), and the adapter gives each its own part. A
+// video with no playable URL (e.g. view-once) isn't one of them; alone it's the
+// "[Video]" label. An uncaptioned picture or album keeps empty text (the watch
+// shows no caption); a captioned one keeps its caption, already in `text`.
+//
+// A sticker (with no photo or video beside it) is shown as its picture: the same
+// imageMime marker, served by the image download, with no text under it.
+//
+// Audio (with no photo, video or sticker beside it) becomes a voice note:
+// audioMime makes the adapter add an AUDIO mediaContent (mediaID = messageId)
+// that DownloadMediaToFile serves; the phone reads the file for its length and
+// waveform. With no words of its own it keeps a label, which the phone reads as
+// "no caption".
+func tagMedia(payload map[string]any, messageId, text string, partsByMsg map[string][]fbPart, audByMsg map[string]fbAud, xmaByMsg map[string]fbLink, ctaByMsg map[string]string, stkByMsg map[string]fbImg) {
+	if card, ok := xmaByMsg[messageId]; ok {
+		// Share card (link preview, shared post, etc.). Its picture is the card's,
+		// not the sender's photo, so no image is tagged. The text is handled like
+		// any other network's link message (see tagLink).
+		u := card.URL
+		if u == "" {
+			u = ctaByMsg[messageId]
 		}
-		if body == "" {
-			payload["text"] = "[Link]"
-		} else {
-			payload["text"] = "[Link]\n" + body
-		}
+		tagLink(payload, text, card.Title, u)
 		return
 	}
-	if im, ok := imgByMsg[messageId]; ok {
-		payload["imageMime"] = im.Mime // signals the adapter to add mediaContent (mediaID = messageId)
-		// No "[image]" placeholder: imageMime alone makes the watch render the
-		// photo. An uncaptioned photo keeps empty text (so the watch doesn't show
-		// a spurious "[image]" caption under it); a captioned one keeps its real
-		// caption, which is already in `text`.
-	} else if vidByMsg[messageId] {
-		// Video isn't streamed to the watch, so the label is the only indication.
-		if strings.TrimSpace(text) == "" {
-			payload["text"] = "[video]"
+	hasImg, hasVid := false, false
+	var shown []fbPart
+	for _, p := range partsByMsg[messageId] {
+		switch {
+		case p.Img != nil:
+			hasImg = true
+			shown = append(shown, p)
+		case p.Vid != nil:
+			hasVid = true
+			if p.Vid.URL != "" {
+				shown = append(shown, p)
+			}
 		}
-	} else if ctaByMsg[messageId] {
-		// Bare link/CTA (no XMA card, image, or video). Mark it "[Link]" so the
-		// watch renders it as a link instead of an empty bubble, and a reply can
-		// quote it as a link. Keep any caption on its own line beneath the marker.
-		if strings.TrimSpace(text) == "" {
-			payload["text"] = "[Link]"
+	}
+	switch {
+	case len(shown) == 1 && shown[0].Key == messageId:
+		if p := shown[0]; p.Img != nil {
+			payload["imageMime"] = p.Img.Mime
 		} else {
-			payload["text"] = "[Link]\n" + text
+			payload["videoMime"] = p.Vid.Mime
+			if p.Vid.GifLike {
+				payload["gifLike"] = true
+			} else if p.Vid.Poster != "" {
+				payload["posterMediaID"] = fbPosterKey(messageId)
+			}
 		}
+	case len(shown) > 0:
+		media := make([]map[string]any, 0, len(shown))
+		for _, p := range shown {
+			media = append(media, fbPartJSON(p))
+		}
+		payload["media"] = media
+	}
+	if hasVid && !hasImg && len(shown) <= 1 && strings.TrimSpace(text) == "" {
+		payload["text"] = "[Video]"
+	}
+	st, hasStk := stkByMsg[messageId]
+	if hasStk && !hasImg && !hasVid {
+		payload["imageMime"] = st.Mime
+	}
+	au, hasAud := audByMsg[messageId]
+	if hasAud && !hasImg && !hasVid && !hasStk {
+		if strings.TrimSpace(text) == "" {
+			if au.Voice {
+				payload["text"] = "[Voice message]"
+			} else {
+				payload["text"] = "[Audio]"
+			}
+		}
+		if au.URL != "" {
+			payload["audioMime"] = au.Mime
+		}
+	}
+	if u, ok := ctaByMsg[messageId]; ok && !hasImg && !hasVid && !hasStk && !hasAud {
+		// Bare link/CTA (no XMA card, image, video, sticker, or audio).
+		tagLink(payload, text, "", u)
 	}
 }
 
+// fbPartJSON is one album item for the adapter: a picture, or a video with its
+// GIF flag or poster.
+func fbPartJSON(p fbPart) map[string]any {
+	if p.Img != nil {
+		return map[string]any{"kind": "image", "mime": p.Img.Mime, "id": p.Key}
+	}
+	m := map[string]any{"kind": "video", "mime": p.Vid.Mime, "id": p.Key}
+	if p.Vid.GifLike {
+		m["gifLike"] = true
+	} else if p.Vid.Poster != "" {
+		m["posterMediaID"] = fbPosterKey(p.Key)
+	}
+	return m
+}
+
+// fbURLInText finds an http(s) link in a message's text, the way the phone's
+// link-media lookup does.
+var fbURLInText = regexp.MustCompile(`(?i)https?://[^\s<>"'\\\]\[)(}{]+`)
+
+// tagLink sets the text of a message that carries a link card, so the phone sees
+// it the way it sees a link message from WhatsApp or Discord: the sender's own
+// words with the URL in them, no marker. That's what lets the link-media lookup
+// (X, Reddit, Imgur, YouTube, picture links) find the link and caption it with
+// its short label.
+//   - The text already has a link: left exactly as written.
+//   - It doesn't, but the card points at a web address (a share from another
+//     app): that address is added (after the words, or first with the card's
+//     title under it), unwrapped from Facebook's l.facebook.com redirect.
+//   - The card points somewhere inside Facebook, or nowhere: "[Link]" plus the
+//     words or the card's title, as before; there's nothing for the lookup.
+func tagLink(payload map[string]any, text, title, cardURL string) {
+	payload["text"] = fbLinkText(text, title, cardURL)
+}
+
+// fbLinkText is tagLink's text, shared with encrypted chats' share cards.
+func fbLinkText(text, title, cardURL string) string {
+	body := strings.TrimSpace(text)
+	if fbURLInText.MatchString(body) {
+		return text
+	}
+	if cardURL != "" && !fbIsMetaURL(cardURL) {
+		switch {
+		case body != "":
+			return body + "\n" + cardURL
+		case title != "" && title != cardURL:
+			return cardURL + "\n" + title
+		default:
+			return cardURL
+		}
+	}
+	label := body
+	if label == "" {
+		label = title
+	}
+	if label == "" {
+		return "[Link]"
+	}
+	return "[Link]\n" + label
+}
+
+// fbArmadilloText reads a Messenger-app ("armadillo") message from an encrypted
+// chat. The one with content to show is the share card (ExtendedContentMessage):
+// it's how a link, a shared post or reel, a location or a story reply arrives
+// there, and it becomes text the way a cookie thread's share card does
+// (fbLinkText), as mautrix-meta reads it:
+//   - a location share: "[location]" and its title;
+//   - a story reply: "[Story reply]" and the reply's words;
+//   - a card pointing at a web address: the link text;
+//   - otherwise the words sent with it, else its title.
+//
+// Anything else returns no text and is skipped, as before; kind names what it
+// was for the log (structural only).
+func fbArmadilloText(arm *waArmadilloApplication.Armadillo) (text, kind string) {
+	content := arm.GetPayload().GetContent()
+	xma := content.GetExtendedContentMessage()
+	if xma == nil {
+		if content == nil {
+			return "", fmt.Sprintf("armadillo/%T", arm.GetPayload().GetPayload())
+		}
+		return "", fmt.Sprintf("armadillo/%T", content.GetContent())
+	}
+	kind = "armadillo/xma/" + xma.GetTargetType().String()
+	body := strings.TrimSpace(xma.GetMessageText())
+	title := strings.TrimSpace(xma.GetTitleText())
+	if title == "" {
+		title = strings.TrimSpace(xma.GetHeaderTitle())
+	}
+	if title == "" {
+		title = strings.TrimSpace(xma.GetOverlayTitle())
+	}
+
+	if xma.GetTargetType() == waArmadilloXMA.ExtendedContentMessage_FB_STORY_REPLY {
+		reply := fbArmadilloReplyText(xma)
+		if reply == "" {
+			reply = body
+		}
+		if reply == "" {
+			return "[Story reply]", kind
+		}
+		return "[Story reply]\n" + reply, kind
+	}
+
+	cardURL := ""
+	for _, cta := range xma.GetCtas() {
+		if u, err := url.Parse(cta.GetNativeURL()); err == nil && u.Scheme == "messenger" && u.Host == "location_share" {
+			if title != "" {
+				return "[location]\n" + title, kind
+			}
+			return "[location]", kind
+		}
+		u := fbWebURL(cta.GetNativeURL())
+		if u == "" {
+			u = fbWebURL(cta.GetActionURL())
+		}
+		// First web address wins, except that one outside Facebook beats one inside.
+		if u != "" && (cardURL == "" || (fbIsMetaURL(cardURL) && !fbIsMetaURL(u))) {
+			cardURL = u
+		}
+	}
+	if cardURL != "" {
+		return fbLinkText(body, title, cardURL), kind
+	}
+	if body != "" {
+		return body, kind
+	}
+	return title, kind
+}
+
+// fbArmadilloReplyText digs a story reply's own words out of the message the
+// card carries (a consumer message inside a message application).
+func fbArmadilloReplyText(xma *waArmadilloXMA.ExtendedContentMessage) string {
+	app, err := armadilloutil.Unmarshal(&waMsgApplication.MessageApplication{}, xma.GetAssociatedMessage(), 2)
+	if err != nil {
+		return ""
+	}
+	consumer, err := armadilloutil.Unmarshal(&waConsumerApplication.ConsumerApplication{}, app.GetPayload().GetSubProtocol().GetConsumerMessage(), 1)
+	if err != nil {
+		return ""
+	}
+	c := consumer.GetPayload().GetContent()
+	if t := c.GetMessageText().GetText(); t != "" {
+		return strings.TrimSpace(t)
+	}
+	return strings.TrimSpace(c.GetExtendedTextMessage().GetText().GetText())
+}
+
+// fbWebURL returns s as an absolute http(s) address, unwrapping Facebook's link
+// redirect (l.facebook.com/l.php?u=...), or "" when s isn't a web address (an
+// app link, a relative path).
+func fbWebURL(s string) string {
+	s = strings.TrimSpace(s)
+	u, err := url.Parse(s)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return ""
+	}
+	if u.Path == "/l.php" {
+		if inner := u.Query().Get("u"); inner != "" && inner != s {
+			return fbWebURL(inner)
+		}
+	}
+	return s
+}
+
+// fbIsMetaURL reports whether a web address points inside Facebook, Messenger or
+// Instagram (a shared post, reel, page), which the link-media lookup doesn't read.
+func fbIsMetaURL(s string) bool {
+	u, err := url.Parse(s)
+	if err != nil {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	for _, d := range []string{"facebook.com", "fb.com", "fb.watch", "messenger.com", "m.me", "instagram.com", "fbcdn.net", "fbsbx.com"} {
+		if h == d || strings.HasSuffix(h, "."+d) {
+			return true
+		}
+	}
+	return false
+}
+
+// fbLink is a share card's title and the web address it points at ("" when it
+// has none).
+type fbLink struct {
+	Title string
+	URL   string
+}
+
 // collectXma scans rich "XMA" share attachments (link previews, shared posts,
-// FB/IG videos) and returns a per-message human label. A message having an XMA
-// row means it's a share, not a standalone photo, so tagMedia uses this to avoid
-// mislabeling a share's preview thumbnail as "[image]".
-func (b *Bridge) collectXma(tbl *table.LSTable) map[string]string {
-	out := map[string]string{}
+// FB/IG videos) and returns each message's card title and link. A message having
+// an XMA row means it's a share, not a standalone photo, so tagMedia uses this to
+// avoid mislabeling a share's preview thumbnail as "[image]".
+func (b *Bridge) collectXma(tbl *table.LSTable) map[string]fbLink {
+	out := map[string]fbLink{}
 	for _, x := range tbl.LSInsertXmaAttachment {
 		if x == nil || x.MessageId == "" {
 			continue
@@ -946,24 +2273,18 @@ func (b *Bridge) collectXma(tbl *table.LSTable) map[string]string {
 		if label == "" {
 			label = strings.TrimSpace(x.SourceText)
 		}
-		if label == "" {
-			label = strings.TrimSpace(x.ActionUrl)
-		}
-		if label == "" {
-			label = "[link]"
-		}
-		out[x.MessageId] = label
+		out[x.MessageId] = fbLink{Title: label, URL: fbWebURL(x.ActionUrl)}
 	}
 	return out
 }
 
-// collectCta scans link/CTA attachments — a shared link (e.g. a Facebook page)
-// that arrives as a tap-through action rather than a rich XMA share card. Returns
-// the set of message ids carrying a link-bearing CTA. tagMedia labels these
-// "[Link]" when the message has no XMA card / image / video of its own, so the
-// bare link no longer reaches the watch as empty content.
-func (b *Bridge) collectCta(tbl *table.LSTable) map[string]bool {
-	out := map[string]bool{}
+// collectCta scans link/CTA attachments: the tap-through action of a share card,
+// or a shared link (e.g. a Facebook page) that arrives with no card at all.
+// Returns each link-bearing CTA's message id with its web address, unwrapped from
+// Facebook's redirect ("" when the link isn't a web address). The first web
+// address per message wins.
+func (b *Bridge) collectCta(tbl *table.LSTable) map[string]string {
+	out := map[string]string{}
 	for _, c := range tbl.LSInsertAttachmentCta {
 		if c == nil || c.MessageId == "" {
 			continue
@@ -971,7 +2292,13 @@ func (b *Bridge) collectCta(tbl *table.LSTable) map[string]bool {
 		if c.ActionUrl == "" && c.NativeUrl == "" {
 			continue // a non-link CTA (e.g. a bare button) — don't call it a link
 		}
-		out[c.MessageId] = true
+		u := fbWebURL(c.ActionUrl)
+		if u == "" {
+			u = fbWebURL(c.NativeUrl)
+		}
+		if prev, ok := out[c.MessageId]; !ok || (prev == "" && u != "") {
+			out[c.MessageId] = u
+		}
 	}
 	return out
 }
@@ -1030,6 +2357,11 @@ func isFbImageAtt(att *table.LSInsertBlobAttachment) bool {
 	return false
 }
 
+// isFbAudioAtt: a voice message (Messenger's audio type) or any audio file.
+func isFbAudioAtt(att *table.LSInsertBlobAttachment) bool {
+	return att.AttachmentType == table.AttachmentTypeAudio || strings.HasPrefix(att.AttachmentMimeType, "audio/")
+}
+
 func isFbVideoAtt(att *table.LSInsertBlobAttachment) bool {
 	if strings.HasPrefix(att.AttachmentMimeType, "video/") {
 		return true
@@ -1047,58 +2379,349 @@ func fbErrJSON(msg string) string {
 }
 
 // DownloadImageForWatch fetches the image attachment stored under messageId and
-// runs it through the SHARED mirrorbridge encoder. Returns the watch image JSON,
+// runs it through the SHARED watchimage encoder. Returns the watch image JSON,
 // or an {"error":...} object the phone handles gracefully (e.g. an expired URL).
 func (b *Bridge) DownloadImageForWatch(mediaID string, maxW, maxH, maxBytes, quality int) (string, error) {
-	// E2EE image? Decrypt on demand. The blob lives on Meta's CDN encrypted; we
-	// retained the media transport (directPath + keys) when the message arrived
-	// and download+decrypt it now via whatsmeow, then hand the plain JPEG to the
-	// same watch encoder the cookie path uses.
-	b.e2eeImgMu.Lock()
-	xport, isE2EE := b.e2eeImgXport[mediaID]
-	b.e2eeImgMu.Unlock()
-	if !isE2EE {
-		// In-memory miss — try the persisted store (e.g. after an app restart).
-		if loaded := b.loadImgXport(mediaID); loaded != nil {
-			xport = loaded
-			isE2EE = true
-		}
+	raw, err := b.fetchWatchImage(mediaID)
+	if err != nil {
+		return fbErrJSON(err.Error()), nil
 	}
-	if isE2EE {
+	out, err := watchimage.EncodeImageForWatch(raw, maxW, maxH, maxBytes, quality)
+	if err != nil {
+		return fbErrJSON("encode: " + err.Error()), nil
+	}
+	return out, nil
+}
+
+// DownloadMediaForWatch is DownloadImageForWatch's unified twin: the same two
+// fetch paths (E2EE decrypt, or signed CDN URL), but mediaroute decides from the
+// BYTES whether to encode an animation or a still and wraps the reply as
+// {"kind","data"}. Only the fetch is Facebook-specific; the decision is shared
+// with every other bridge.
+//
+// No filter had to be opened for this: isFbImageAtt already accepts
+// AttachmentTypeAnimatedImage, so an animated attachment's bytes were always
+// reaching the encoder — they were simply being encoded as a single frame.
+//
+// Returns "" (not an error JSON) on any failure, because the caller reads empty
+// as "fall back to the still path", which is the right outcome for every problem
+// here.
+func (b *Bridge) DownloadMediaForWatch(mediaID string,
+	maxW, maxH, maxBytes, quality, fpsFloor, maxFrames, gifBytes, startRung int) (string, error) {
+	raw, err := b.fetchWatchImage(mediaID)
+	if err != nil {
+		return "", nil
+	}
+	out, err := mediaroute.Encode(raw, maxW, maxH, maxBytes, quality,
+		fpsFloor, maxFrames, gifBytes, startRung)
+	if err != nil {
+		return "", nil
+	}
+	return out, nil
+}
+
+// fetchWatchImage downloads the picture the watch asked for by mediaID, from one
+// of two places:
+//   - E2EE (a photo, sticker or GIF in an encrypted chat): the media transport
+//     (directPath + keys) retained when the message arrived, in memory or, after
+//     a restart, from fbe2ee.db. Downloaded and decrypted now via whatsmeow, with
+//     the keys of the message type it came in (image keys for photos and
+//     stickers, video keys for a GIF sent as a video message).
+//   - Otherwise the signed CDN URL captured from the cookie thread's attachment.
+//
+// The bytes then go through fbPrepareImage, so a WebP (stickers) reaches the
+// encoder as PNG and a sticker's transparent background is flattened. The error
+// text is what DownloadImageForWatch reports to the phone.
+func (b *Bridge) fetchWatchImage(mediaID string) ([]byte, error) {
+	var raw []byte
+	pic, ok := b.e2eeImageXport(mediaID)
+	sticker := pic.Sticker
+	if ok {
 		// Grab the client pointer under its lock, but run the network download
 		// without holding it (teardown can nil the client between flaps).
 		b.e2eeMu.Lock()
 		client := b.e2eeClient
 		b.e2eeMu.Unlock()
 		if client == nil {
-			return fbErrJSON("e2ee image: client not connected"), nil
+			return nil, errors.New("e2ee image: client not connected")
 		}
-		raw, err := client.DownloadFB(b.ctx, xport, whatsmeow.MediaImage)
+		data, err := client.DownloadFB(b.ctx, pic.Xport, pic.Media)
+		if err != nil && len(data) > 0 &&
+			(errors.Is(err, whatsmeow.ErrInvalidMediaSHA256) || errors.Is(err, whatsmeow.ErrFileLengthMismatch)) {
+			// A warning, with the data: the ciphertext's hash and HMAC passed, so
+			// the bytes are exactly what the sender encrypted (Messenger's GIFs
+			// have come with a plaintext hash that doesn't match). Logged, used.
+			b.imageDiag("warning", mediaID, fbDiagErr(err))
+			err = nil
+		}
 		if err != nil {
-			return fbErrJSON("e2ee download: " + err.Error()), nil
+			return nil, errors.New("e2ee download: " + err.Error())
 		}
-		out, err := mirrorbridge.EncodeImageForWatch(raw, maxW, maxH, maxBytes, quality)
+		raw = data
+	} else {
+		b.imgMu.Lock()
+		im, ok := b.imgURLs[mediaID]
+		b.imgMu.Unlock()
+		if !ok || im.URL == "" {
+			return nil, errors.New("no stored image url for " + mediaID)
+		}
+		data, err := b.httpGetBytes(im.URL, 8*1024*1024)
 		if err != nil {
-			return fbErrJSON("encode: " + err.Error()), nil
+			return nil, errors.New("download: " + err.Error())
 		}
-		return out, nil
+		raw, sticker = data, im.Sticker
 	}
-
-	b.imgMu.Lock()
-	im, ok := b.imgURLs[mediaID]
-	b.imgMu.Unlock()
-	if !ok || im.URL == "" {
-		return fbErrJSON("no stored image url for " + mediaID), nil
-	}
-	raw, err := b.httpGetBytes(im.URL, 8*1024*1024)
+	out, err := fbPrepareImage(raw, sticker)
 	if err != nil {
-		return fbErrJSON("download: " + err.Error()), nil
-	}
-	out, err := mirrorbridge.EncodeImageForWatch(raw, maxW, maxH, maxBytes, quality)
-	if err != nil {
-		return fbErrJSON("encode: " + err.Error()), nil
+		return nil, errors.New("convert: " + err.Error())
 	}
 	return out, nil
+}
+
+// fbE2EEPic is a retained E2EE picture: its transport, the key type it's
+// decrypted with, and whether it's a sticker.
+type fbE2EEPic struct {
+	Xport   *waMediaTransport.WAMediaTransport_Integral
+	Media   whatsmeow.MediaType
+	Sticker bool
+}
+
+// e2eeImageXport finds the retained E2EE transport for the picture the watch
+// asks for by message id: a photo (bare id), a sticker (fbStickerKey) or a GIF
+// sent in a video message (fbVideoImageKey). Memory first, then fbe2ee.db.
+// ok is false when it isn't an E2EE picture.
+func (b *Bridge) e2eeImageXport(mediaID string) (pic fbE2EEPic, ok bool) {
+	keys := []struct {
+		key string
+		pic fbE2EEPic
+	}{
+		{mediaID, fbE2EEPic{Media: whatsmeow.MediaImage}},
+		{fbStickerKey(mediaID), fbE2EEPic{Media: whatsmeow.MediaImage, Sticker: true}},
+		{fbVideoImageKey(mediaID), fbE2EEPic{Media: whatsmeow.MediaVideo}},
+	}
+	b.e2eeImgMu.Lock()
+	for _, k := range keys {
+		if x := b.e2eeImgXport[k.key]; x != nil {
+			b.e2eeImgMu.Unlock()
+			k.pic.Xport = x
+			return k.pic, true
+		}
+	}
+	b.e2eeImgMu.Unlock()
+	for _, k := range keys {
+		if x := b.loadImgXport(k.key); x != nil {
+			k.pic.Xport = x
+			return k.pic, true
+		}
+	}
+	return fbE2EEPic{}, false
+}
+
+// imageDiag emits a DIAG line about a picture download (structural only).
+func (b *Bridge) imageDiag(reason, mediaID, detail string) {
+	out, _ := json.Marshal(map[string]string{"image": reason, "id": mediaID, "detail": detail})
+	b.emit("DIAG", string(out))
+}
+
+// fbIsWebP reports whether data is a WebP file.
+func fbIsWebP(data []byte) bool {
+	return len(data) >= 12 && string(data[0:4]) == "RIFF" && string(data[8:12]) == "WEBP"
+}
+
+// fbRiffChunks splits a RIFF body into (fourcc, chunk bytes including its
+// 8-byte header and pad) pairs.
+func fbRiffChunks(body []byte) (names []string, chunks [][]byte) {
+	for i := 0; i+8 <= len(body); {
+		n := int(binary.LittleEndian.Uint32(body[i+4 : i+8]))
+		end := i + 8 + n
+		if n < 0 || end > len(body) {
+			break
+		}
+		next := end + (n & 1)
+		if next > len(body) {
+			next = len(body)
+		}
+		names = append(names, string(body[i:i+4]))
+		chunks = append(chunks, body[i:next])
+		i = next
+	}
+	return
+}
+
+func fbU24(b []byte) int { return int(b[0]) | int(b[1])<<8 | int(b[2])<<16 }
+
+func fbPutU24(b []byte, v int) { b[0], b[1], b[2] = byte(v), byte(v>>8), byte(v>>16) }
+
+// fbRiff wraps chunks as a WebP file.
+func fbRiff(chunks ...[]byte) []byte {
+	var body bytes.Buffer
+	body.WriteString("WEBP")
+	for _, c := range chunks {
+		body.Write(c)
+	}
+	out := make([]byte, 8, 8+body.Len())
+	copy(out, "RIFF")
+	binary.LittleEndian.PutUint32(out[4:8], uint32(body.Len()))
+	return append(out, body.Bytes()...)
+}
+
+// fbWebPStill decodes a WebP picture. An animated WebP (which the decoder
+// doesn't read) gives its first frame, placed on the full canvas: the frame's
+// own chunks are lifted out into a standalone WebP and decoded.
+func fbWebPStill(data []byte) (image.Image, error) {
+	if img, err := webp.Decode(bytes.NewReader(data)); err == nil {
+		return fbVP8Colors(img), nil
+	}
+	if !fbIsWebP(data) {
+		return nil, errors.New("not webp")
+	}
+	names, chunks := fbRiffChunks(data[12:])
+	cw, ch := 0, 0
+	for k, name := range names {
+		c := chunks[k]
+		switch name {
+		case "VP8X":
+			if len(c) >= 18 {
+				cw, ch = fbU24(c[12:15])+1, fbU24(c[15:18])+1
+			}
+		case "ANMF":
+			if len(c) < 8+16 {
+				return nil, errors.New("webp: short frame")
+			}
+			p := c[8:]
+			fx, fy := fbU24(p[0:3])*2, fbU24(p[3:6])*2
+			fw, fh := fbU24(p[6:9])+1, fbU24(p[9:12])+1
+			subNames, subs := fbRiffChunks(p[16:])
+			var alph, vp8, vp8l []byte
+			for j, sn := range subNames {
+				switch sn {
+				case "ALPH":
+					alph = subs[j]
+				case "VP8 ":
+					vp8 = subs[j]
+				case "VP8L":
+					vp8l = subs[j]
+				}
+			}
+			var still []byte
+			switch {
+			case vp8l != nil:
+				still = fbRiff(vp8l)
+			case vp8 != nil && alph != nil:
+				x := make([]byte, 18)
+				copy(x, "VP8X")
+				binary.LittleEndian.PutUint32(x[4:8], 10)
+				x[8] = 0x10 // alpha
+				fbPutU24(x[12:15], fw-1)
+				fbPutU24(x[15:18], fh-1)
+				still = fbRiff(x, alph, vp8)
+			case vp8 != nil:
+				still = fbRiff(vp8)
+			default:
+				return nil, errors.New("webp: frame without image data")
+			}
+			frame, err := webp.Decode(bytes.NewReader(still))
+			if err != nil {
+				return nil, err
+			}
+			frame = fbVP8Colors(frame)
+			if cw <= 0 || ch <= 0 || cw*ch > 4096*4096 {
+				return frame, nil
+			}
+			canvas := image.NewNRGBA(image.Rect(0, 0, cw, ch))
+			r := image.Rect(fx, fy, fx+fw, fy+fh)
+			draw.Draw(canvas, r, frame, frame.Bounds().Min, draw.Src)
+			return canvas, nil
+		}
+	}
+	return nil, errors.New("webp: no frame found")
+}
+
+// fbVP8Colors converts a decoded lossy WebP picture to RGB. The decoder hands
+// back Go's YCbCr image types, whose built-in conversion is JPEG's full-range
+// one; VP8 is limited-range (BT.601, Y 16-235), so converting with Go's
+// would wash the colours out. Other images pass through.
+func fbVP8Colors(img image.Image) image.Image {
+	var yc *image.YCbCr
+	var na *image.NYCbCrA
+	switch v := img.(type) {
+	case *image.YCbCr:
+		yc = v
+	case *image.NYCbCrA:
+		yc, na = &v.YCbCr, v
+	default:
+		return img
+	}
+	b := yc.Bounds()
+	out := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	clamp := func(v int32) uint8 {
+		if v < 0 {
+			return 0
+		}
+		if v > 255<<16 {
+			return 255
+		}
+		return uint8((v + 1<<15) >> 16)
+	}
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			yy := (int32(yc.Y[yc.YOffset(x, y)]) - 16) * 76284 // 1.164
+			ci := yc.COffset(x, y)
+			cb := int32(yc.Cb[ci]) - 128
+			cr := int32(yc.Cr[ci]) - 128
+			o := out.PixOffset(x-b.Min.X, y-b.Min.Y)
+			out.Pix[o+0] = clamp(yy + 104595*cr)           // 1.596
+			out.Pix[o+1] = clamp(yy - 25624*cb - 53281*cr) // 0.391, 0.813
+			out.Pix[o+2] = clamp(yy + 132252*cb)           // 2.018
+			out.Pix[o+3] = 255
+			if na != nil {
+				out.Pix[o+3] = na.A[na.AOffset(x, y)]
+			}
+		}
+	}
+	return out
+}
+
+// fbFlatten draws img over white: a sticker's transparent background reads as
+// the chat's light background instead of black.
+func fbFlatten(img image.Image) *image.RGBA {
+	b := img.Bounds()
+	out := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	draw.Draw(out, out.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+	draw.Draw(out, out.Bounds(), img, b.Min, draw.Over)
+	return out
+}
+
+// fbPrepareImage turns downloaded image bytes into something the shared watch
+// encoder reads (GIF, JPEG, PNG). WebP, which it doesn't read, becomes PNG (an
+// animated one: its first frame). A sticker's transparency is flattened onto
+// white. Anything else passes through untouched.
+func fbPrepareImage(raw []byte, sticker bool) ([]byte, error) {
+	var img image.Image
+	switch {
+	case fbIsWebP(raw):
+		i, err := fbWebPStill(raw)
+		if err != nil {
+			return nil, err
+		}
+		img = i
+	case sticker && bytes.HasPrefix(raw, []byte("\x89PNG")):
+		i, err := png.Decode(bytes.NewReader(raw))
+		if err != nil {
+			return raw, nil // let the encoder report it
+		}
+		img = i
+	default:
+		return raw, nil
+	}
+	if sticker {
+		img = fbFlatten(img)
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // httpGetBytes GETs a (public, signed) FB CDN URL with a browser user-agent.
@@ -1117,6 +2740,434 @@ func (b *Bridge) httpGetBytes(url string, maxBytes int64) ([]byte, error) {
 		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, maxBytes))
+}
+
+// maxVideoBytes refuses anything absurd before downloading it (same cap as the
+// other bridges).
+const maxVideoBytes = 64 * 1024 * 1024
+
+// fbVideoChunk is the Range size for video.xx.fbcdn.net downloads, matching
+// mautrix-meta.
+const fbVideoChunk = 1 * 1024 * 1024
+
+var errFbVideoTooLarge = errors.New("too large")
+
+// fbVidStripes serializes downloads of the same video. The phone asks for a
+// clip's preview and its full animation at the same moment; two downloads of one
+// video at once failed (one decrypting its file while the other was still
+// writing, the other refused by Meta with a 400). Striped by media id, so
+// different videos never wait on each other.
+var fbVidStripes [16]sync.Mutex
+
+func fbVidLock(mediaID string) *sync.Mutex {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(mediaID))
+	return &fbVidStripes[h.Sum32()%uint32(len(fbVidStripes))]
+}
+
+// fbVidFile is a video this bridge wrote recently: where, and how big.
+type fbVidFile struct {
+	Path string
+	Size int64
+}
+
+// recentVideo returns the file last written for mediaID, if it's still there
+// whole.
+func (b *Bridge) recentVideo(mediaID string) (fbVidFile, bool) {
+	b.vidDoneMu.Lock()
+	f, ok := b.vidDone[mediaID]
+	b.vidDoneMu.Unlock()
+	if !ok {
+		return f, false
+	}
+	if st, err := os.Stat(f.Path); err != nil || st.Size() != f.Size {
+		b.vidDoneMu.Lock()
+		delete(b.vidDone, mediaID)
+		b.vidDoneMu.Unlock()
+		return f, false
+	}
+	return f, true
+}
+
+// rememberVideo records a written video (the 16 most recent).
+func (b *Bridge) rememberVideo(mediaID, path string, size int64) {
+	const keep = 16
+	b.vidDoneMu.Lock()
+	defer b.vidDoneMu.Unlock()
+	if b.vidDone == nil {
+		b.vidDone = make(map[string]fbVidFile)
+	}
+	if _, ok := b.vidDone[mediaID]; !ok {
+		b.vidDoneOrder = append(b.vidDoneOrder, mediaID)
+		for len(b.vidDoneOrder) > keep {
+			delete(b.vidDone, b.vidDoneOrder[0])
+			b.vidDoneOrder = b.vidDoneOrder[1:]
+		}
+	}
+	b.vidDone[mediaID] = fbVidFile{Path: path, Size: size}
+}
+
+// fbWriteAtomic builds a file under a temporary name next to path and renames it
+// into place only once it's complete, so nothing ever reads a partial file.
+func fbWriteAtomic(path string, write func(tmp string) (int64, error)) (int64, error) {
+	tmp := path + ".part" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	n, err := write(tmp)
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+		return 0, err
+	}
+	return n, nil
+}
+
+// fbCopyFile copies src to dst (atomically) and returns the byte count.
+func fbCopyFile(src, dst string) (int64, error) {
+	return fbWriteAtomic(dst, func(tmp string) (int64, error) {
+		in, err := os.Open(src)
+		if err != nil {
+			return 0, err
+		}
+		defer in.Close()
+		out, err := os.Create(tmp)
+		if err != nil {
+			return 0, err
+		}
+		n, err := io.Copy(out, in)
+		if cerr := out.Close(); err == nil {
+			err = cerr
+		}
+		return n, err
+	})
+}
+
+// DownloadMediaToFile writes the complete, playable video or audio file for
+// mediaID (the message id the watch was given) to path, for the phone's video
+// streamer and voice cards. Returns the byte count, or -1 on any failure, never
+// leaving a partial file.
+//
+// Two sources, like the image path: an E2EE file is downloaded and decrypted
+// from its retained media transport; a cookie-thread file is fetched from its
+// signed playable URL the way mautrix-meta does it. One download per file at a
+// time; a request for a file that was just written reuses it.
+func (b *Bridge) DownloadMediaToFile(mediaID, path string) int64 {
+	lk := fbVidLock(mediaID)
+	lk.Lock()
+	defer lk.Unlock()
+	if prev, ok := b.recentVideo(mediaID); ok {
+		if prev.Path == path {
+			return prev.Size
+		}
+		if n, err := fbCopyFile(prev.Path, path); err == nil && n == prev.Size {
+			b.rememberVideo(mediaID, path, n)
+			return n
+		}
+	}
+	n := b.downloadVideo(mediaID, path)
+	if n > 0 {
+		b.rememberVideo(mediaID, path, n)
+	} else {
+		_ = os.Remove(path) // never leave an older or partial file where the phone looks
+	}
+	return n
+}
+
+// downloadVideo does the actual download for DownloadMediaToFile: a video or an
+// audio file (voice notes play on the watch, through the same call).
+func (b *Bridge) downloadVideo(mediaID, path string) int64 {
+	if wt := b.lookupVidXport(mediaID); wt != nil {
+		return b.downloadE2EEFile(mediaID, path, wt, whatsmeow.MediaVideo, "video")
+	}
+	if wt := b.lookupAudXport(mediaID); wt != nil {
+		return b.downloadE2EEFile(mediaID, path, wt, whatsmeow.MediaAudio, "audio")
+	}
+
+	kind := "video"
+	b.imgMu.Lock()
+	v, ok := b.vidURLs[mediaID]
+	if !ok {
+		if a, aok := b.audURLs[mediaID]; aok {
+			v, ok, kind = fbVid{URL: a.URL, Fallback: a.Fallback, Mime: a.Mime, Size: a.Size}, true, "audio"
+		}
+	}
+	b.imgMu.Unlock()
+	if !ok || v.URL == "" {
+		b.videoDiag("no stored handle", mediaID, "")
+		return -1
+	}
+	if v.Size > maxVideoBytes {
+		b.fileDiag(kind, "too large", mediaID, "")
+		return -1
+	}
+	n, err := fbWriteAtomic(path, func(tmp string) (int64, error) {
+		n, err := b.fbDownloadVideo(v.URL, tmp, maxVideoBytes, kind)
+		if err != nil && !errors.Is(err, errFbVideoTooLarge) && v.Fallback != "" && v.Fallback != v.URL {
+			n, err = b.fbDownloadVideo(v.Fallback, tmp, maxVideoBytes, kind)
+		}
+		return n, err
+	})
+	if err != nil {
+		if errors.Is(err, errFbVideoTooLarge) {
+			b.fileDiag(kind, "too large", mediaID, "")
+		} else {
+			b.fileDiag(kind, "download failed", mediaID, fbDiagErr(err))
+		}
+		return -1
+	}
+	return n
+}
+
+// downloadE2EEFile downloads and decrypts a retained E2EE video or audio file
+// (kind names it in the DIAG lines) into path. In memory, like this bridge's
+// E2EE images and mautrix-meta's media.
+func (b *Bridge) downloadE2EEFile(mediaID, path string, wt *waMediaTransport.WAMediaTransport, media whatsmeow.MediaType, kind string) int64 {
+	if wt.GetAncillary().GetFileLength() > maxVideoBytes {
+		b.fileDiag(kind, "too large", mediaID, "")
+		return -1
+	}
+	b.e2eeMu.Lock()
+	client := b.e2eeClient
+	b.e2eeMu.Unlock()
+	if client == nil {
+		b.fileDiag(kind, "download failed", mediaID, "e2ee client not connected")
+		return -1
+	}
+	data, err := client.DownloadFB(b.ctx, wt.GetIntegral(), media)
+	if err != nil && len(data) > 0 &&
+		(errors.Is(err, whatsmeow.ErrInvalidMediaSHA256) || errors.Is(err, whatsmeow.ErrFileLengthMismatch)) {
+		// whatsmeow reports these as warnings and returns the data: the
+		// ciphertext's hash and HMAC already passed, so the bytes are exactly
+		// what the sender encrypted. Logged, then used.
+		b.fileDiag(kind, "warning", mediaID, fbDiagErr(err))
+		err = nil
+	}
+	if err != nil {
+		b.fileDiag(kind, "download failed", mediaID, fbDiagErr(err))
+		return -1
+	}
+	if len(data) == 0 {
+		b.fileDiag(kind, "download failed", mediaID, "empty file")
+		return -1
+	}
+	if int64(len(data)) > maxVideoBytes {
+		b.fileDiag(kind, "too large", mediaID, "")
+		return -1
+	}
+	if kind == "video" && (len(data) < 12 || string(data[4:8]) != "ftyp") {
+		// Not an MP4 (the phone's decoder will refuse it): name what it is.
+		head := data
+		if len(head) > 8 {
+			head = head[:8]
+		}
+		b.videoDiag("warning", mediaID, fmt.Sprintf("not mp4, starts %q", head))
+	}
+	n, err := fbWriteAtomic(path, func(tmp string) (int64, error) {
+		return int64(len(data)), os.WriteFile(tmp, data, 0o600)
+	})
+	if err != nil {
+		b.fileDiag(kind, "download failed", mediaID, "write file")
+		return -1
+	}
+	return n
+}
+
+// videoDiag emits the DIAG line the phone's exported log shows when a video
+// download fails. Structural only: the reason, the message id, and a URL-free
+// error detail.
+func (b *Bridge) videoDiag(reason, mediaID, detail string) {
+	b.fileDiag("video", reason, mediaID, detail)
+}
+
+// fileDiag is videoDiag for any kind of file ("video", "audio").
+func (b *Bridge) fileDiag(kind, reason, mediaID, detail string) {
+	out, _ := json.Marshal(map[string]string{kind: reason, "id": mediaID, "detail": detail})
+	b.emit("DIAG", string(out))
+}
+
+// fbDiagErr shortens an error for DIAG, dropping anything from the first URL on
+// (Go HTTP and whatsmeow errors embed the full signed URL).
+func fbDiagErr(err error) string {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		err = ue.Err
+	}
+	msg := err.Error()
+	if i := strings.Index(msg, "http"); i >= 0 {
+		msg = strings.TrimSpace(msg[:i]) + " <url>"
+	}
+	if len(msg) > 120 {
+		msg = msg[:120]
+	}
+	return msg
+}
+
+// fbLogText is an error's text for a log line: any address in it (a socket's,
+// with its session ids; a checkpoint's) becomes <url>, and it's capped.
+var fbLogURL = regexp.MustCompile(`(?i)\b(?:https?|wss?)://[^\s"']+`)
+
+func fbLogText(s string) string {
+	s = fbLogURL.ReplaceAllString(s, "<url>")
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	return s
+}
+
+// fbVideoHeaders sets the browser headers mautrix-meta sends for media; dest is
+// "video" or "audio".
+func fbVideoHeaders(h http.Header, dest string) {
+	h.Set("Accept", "*/*")
+	h.Set("Sec-Fetch-Dest", dest)
+	h.Set("Sec-Fetch-Mode", "no-cors")
+	h.Set("Sec-Fetch-Site", "cross-site")
+	h.Set("User-Agent", useragent.UserAgent)
+	h.Set("sec-ch-ua", useragent.SecCHUserAgent)
+	h.Set("sec-ch-ua-platform", useragent.SecCHPlatform)
+}
+
+// fbVideoHTTPClient follows redirects except to video.xx.fbcdn.net, which must
+// be fetched in byte ranges (mautrix-meta's mediaHTTPClient behaves the same).
+var fbVideoHTTPClient = &http.Client{
+	Timeout: 5 * time.Minute,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if req.URL.Hostname() == "video.xx.fbcdn.net" {
+			return http.ErrUseLastResponse
+		}
+		if len(via) >= 10 {
+			return errors.New("too many redirects")
+		}
+		return nil
+	},
+}
+
+// fbDownloadVideo fetches a cookie-thread video (or audio file, dest "audio") to
+// path. A plain GET is tried first; a redirect to video.xx.fbcdn.net switches to
+// a chunked Range download, exactly as mautrix-meta does.
+func (b *Bridge) fbDownloadVideo(rawURL, path string, maxBytes int64, dest string) (int64, error) {
+	req, err := http.NewRequestWithContext(b.ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	fbVideoHeaders(req.Header, dest)
+	resp, err := fbVideoHTTPClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		defer resp.Body.Close()
+		if resp.ContentLength > maxBytes {
+			return 0, errFbVideoTooLarge
+		}
+		return fbWriteFile(path, resp.Body, maxBytes)
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		if loc, lerr := resp.Location(); lerr == nil && loc.Hostname() == "video.xx.fbcdn.net" {
+			return b.fbChunkedVideo(loc.String(), path, maxBytes, dest)
+		}
+	}
+	return 0, fmt.Errorf("GET status %d", resp.StatusCode)
+}
+
+// fbChunkedVideo downloads a video.xx.fbcdn.net file in byte ranges after a HEAD
+// confirms range support and the size.
+func (b *Bridge) fbChunkedVideo(rawURL, path string, maxBytes int64, dest string) (int64, error) {
+	head, err := http.NewRequestWithContext(b.ctx, http.MethodHead, rawURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	fbVideoHeaders(head.Header, dest)
+	hresp, err := fbVideoHTTPClient.Do(head)
+	if err != nil {
+		return 0, err
+	}
+	hresp.Body.Close()
+	if hresp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("HEAD status %d", hresp.StatusCode)
+	}
+	if hresp.Header.Get("Accept-Ranges") != "bytes" {
+		return 0, errors.New("no range support")
+	}
+	total := hresp.ContentLength
+	if total <= 0 {
+		return 0, errors.New("no size")
+	}
+	if total > maxBytes {
+		return 0, errFbVideoTooLarge
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return 0, err
+	}
+	var off int64
+	for off < total {
+		end := off + fbVideoChunk - 1
+		if end >= total {
+			end = total - 1
+		}
+		req, rerr := http.NewRequestWithContext(b.ctx, http.MethodGet, rawURL, nil)
+		if rerr != nil {
+			f.Close()
+			return 0, rerr
+		}
+		fbVideoHeaders(req.Header, dest)
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, end))
+		resp, rerr := fbVideoHTTPClient.Do(req)
+		if rerr != nil {
+			f.Close()
+			return 0, rerr
+		}
+		want := end - off + 1
+		switch {
+		case resp.StatusCode == http.StatusPartialContent:
+		case resp.StatusCode == http.StatusOK && off == 0:
+			// Range ignored and the whole file sent: take it in one pass.
+			want = total
+		default:
+			resp.Body.Close()
+			f.Close()
+			return 0, fmt.Errorf("chunk status %d", resp.StatusCode)
+		}
+		n, cerr := io.Copy(f, io.LimitReader(resp.Body, want))
+		resp.Body.Close()
+		if cerr != nil {
+			f.Close()
+			return 0, cerr
+		}
+		if n == 0 {
+			f.Close()
+			return 0, errors.New("empty chunk")
+		}
+		off += n
+	}
+	if err := f.Close(); err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
+// fbWriteFile streams body to path, failing (rather than truncating) if it
+// exceeds maxBytes.
+func fbWriteFile(path string, body io.Reader, maxBytes int64) (int64, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return 0, err
+	}
+	n, err := io.Copy(f, io.LimitReader(body, maxBytes+1))
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return 0, err
+	}
+	if n > maxBytes {
+		return 0, errFbVideoTooLarge
+	}
+	if n == 0 {
+		return 0, errors.New("empty body")
+	}
+	return n, nil
 }
 
 // dumpTableFields uses reflection to report which slice fields of the LSTable
@@ -1189,6 +3240,13 @@ func (b *Bridge) Connect() error {
 	_, initialTable, err := b.client.LoadMessagesPage(b.ctx)
 	if err != nil {
 		return err
+	}
+	// Our own id, before the snapshot below is turned into messages: it decides
+	// which of them are ours (isMe). It used to be learned only at READY, which
+	// comes after the snapshot, so every message of ours in it showed as from
+	// someone else (labeled with our own name). The c_user cookie holds it now.
+	if b.fbid == 0 {
+		b.fbid = b.fbidFromCookies()
 	}
 	if initialTable != nil {
 		b.emitTableDeltas(initialTable, false)
@@ -1269,13 +3327,25 @@ func (b *Bridge) ListConversations(count int) (string, error) {
 	return `{"conversations":[]}`, nil
 }
 
-// FetchMessages returns up to count messages from a thread as JSON. messagix
-// backfills older messages by thread key + a timestamp/offset cursor.
+// FetchMessages returns up to count older messages from a thread as JSON,
+// oldest-first, plus a cursor to page further back and an exhausted flag when the
+// top of the thread is reached.
 //
-// VERIFY: the fetch-messages call. Unlike libgm's clean FetchMessages, messagix
-// historically pulls message history via FetchMessages(ctx, threadKey, ...) OR
-// via a GraphQL call returning an LSTable of LSInsertMessage rows. Confirm the
-// exact method name + params (threadKey int64, count, before-timestamp cursor).
+// How it works (mirrors mautrix-meta's connector backfill for the pinned version,
+// v0.2604.0): messagix does NOT return history from the synchronous ExecuteTasks
+// call. A FetchMessagesTask is fire-and-forget; the actual page arrives as a later
+// PublishResponse delta (message rows + an LSInsertNewMessageRange). So we register
+// a per-thread collector, fire the task, and block here on a bounded wait loop
+// while emitTableDeltas feeds rows + range into the collector. We page again with
+// the range's oldest (id, ts) until we have `count` messages or HasMoreBefore is
+// false, exactly like the upstream connector.
+//
+// Anchoring: the task pages strictly OLDER than a concrete
+// (ReferenceMessageId, ReferenceTimestampMs). A timestamp alone is not enough —
+// with an empty ReferenceMessageId Meta returns no page (that was the original
+// "ins=0 ups=0 messages:null" bug). The anchor comes from the Kotlin cursor
+// (oldest LOADED message), falling back to the bridge's own oldest-seen if the
+// caller supplied none.
 func (b *Bridge) FetchMessages(threadKey string, count int64, cursorJSON string) (string, error) {
 	if b.client == nil {
 		return `{"messages":[]}`, nil
@@ -1285,118 +3355,161 @@ func (b *Bridge) FetchMessages(threadKey string, count int64, cursorJSON string)
 		return "", fmt.Errorf("bad threadKey: %w", err)
 	}
 
-	// Anchor: FetchMessagesTask pages backward from a reference point. The thread
-	// row gives us no message ID, only LastActivityTimestampMs — so we anchor on
-	// that (captured as CONVERSATION rows arrived). Anchoring on the thread's real
-	// last activity (rather than "now") is what gives the server a valid point to
-	// page history from. The fetched page arrives ASYNCHRONOUSLY as a later table
-	// delta (LSUpsertMessage rows) through the realtime event stream, which our
-	// emitTableDeltas -> MESSAGE -> cacheMessage path already captures; the table
-	// ExecuteTasks returns here is usually empty (the request is fire-and-forget).
-	b.taMu.Lock()
-	refTs := b.threadActivity[tk]
-	b.taMu.Unlock()
-	if refTs == 0 {
-		refTs = time.Now().UnixMilli()
+	// Known-E2EE thread: its history lives on the whatsmeow socket, not in the
+	// Lightspeed table, so a cookie FetchMessagesTask can never return it. Report
+	// exhaustion immediately rather than blocking the watch for the timeout. (This
+	// is the analog of upstream's ENCRYPTED_OVER_WA short-circuit.)
+	if _, isE2EE := b.e2eeJIDFor(tk); isE2EE {
+		return fmt.Sprintf(`{"messages":[],"exhausted":true,"_dbg":"e2ee-thread tk=%d"}`, tk), nil
 	}
+
+	// Resolve the paging anchor (see doc comment). Prefer the caller's cursor.
 	var refMsgId string
-	cursor := b.client.GetCursor(1)
+	var refTs int64
+	var pageCursor string
 	if cursorJSON != "" {
 		var cur struct {
-			ReferenceTimestampMs int64  `json:"referenceTimestampMs"`
 			ReferenceMessageId   string `json:"referenceMessageId"`
+			ReferenceTimestampMs int64  `json:"referenceTimestampMs"`
 			Cursor               string `json:"cursor"`
 		}
 		if err := json.Unmarshal([]byte(cursorJSON), &cur); err != nil {
 			return "", fmt.Errorf("invalid cursor JSON: %w", err)
 		}
-		if cur.ReferenceTimestampMs != 0 {
-			refTs = cur.ReferenceTimestampMs
-		}
 		refMsgId = cur.ReferenceMessageId
-		if cur.Cursor != "" {
-			cursor = cur.Cursor
+		refTs = cur.ReferenceTimestampMs
+		pageCursor = cur.Cursor
+	}
+	if refMsgId == "" {
+		b.oldestMu.Lock()
+		if a, ok := b.oldestSeen[tk]; ok {
+			refMsgId = a.MsgId
+			refTs = a.TsMs
 		}
+		b.oldestMu.Unlock()
+	}
+	if pageCursor == "" {
+		pageCursor = b.client.GetCursor(1)
+	}
+	if refMsgId == "" || refTs == 0 {
+		// No concrete anchor: typically an E2EE 1:1 whose content isn't in the
+		// Lightspeed table, or a thread we've seen no cookie message for yet.
+		// Report exhaustion so the phone stops asking rather than firing anchorless
+		// fetches that silently return nothing.
+		return fmt.Sprintf(`{"messages":[],"exhausted":true,"_dbg":"no-anchor tk=%d"}`, tk), nil
 	}
 
-	task := &socket.FetchMessagesTask{
-		ThreadKey:            tk,
-		Direction:            0, // 0 = fetch older than the reference point
-		ReferenceTimestampMs: refTs,
-		ReferenceMessageId:   refMsgId,
-		SyncGroup:            1,
-		Cursor:               cursor,
+	want := int(count)
+
+	// Register the collector BEFORE firing, so a fast async page is captured (and
+	// routed non-live) rather than emitted as a fresh message that jumps the reader.
+	bf := newFbBackfill(want)
+	b.bfMu.Lock()
+	if _, busy := b.bfCollectors[tk]; busy {
+		b.bfMu.Unlock()
+		return `{"messages":[],"_dbg":"busy"}`, nil
+	}
+	b.bfCollectors[tk] = bf
+	b.bfMu.Unlock()
+	defer func() {
+		b.bfMu.Lock()
+		delete(b.bfCollectors, tk)
+		b.bfMu.Unlock()
+	}()
+
+	fire := func(anchorId string, anchorTs int64) error {
+		_, e := b.client.ExecuteTasks(b.ctx, &socket.FetchMessagesTask{
+			ThreadKey:            tk,
+			Direction:            0, // older than the reference point
+			ReferenceTimestampMs: anchorTs,
+			ReferenceMessageId:   anchorId,
+			SyncGroup:            1,
+			Cursor:               pageCursor,
+		})
+		return e
 	}
 
-	// Fire the fetch. ExecuteTasks sends the task; the response page usually
-	// arrives later as a realtime delta (handled by emitTableDeltas), but we
-	// still read any rows that DO come back synchronously as a bonus.
-	tbl, err := b.client.ExecuteTasks(b.ctx, task)
-	if err != nil {
+	if err := fire(refMsgId, refTs); err != nil {
 		return "", fmt.Errorf("fetch messages: %w", err)
 	}
-	log := newLogger()
-	if tbl == nil {
-		log.Warn().Int64("thread", tk).Int64("refTs", refTs).Msg("FETCHMSG: nil table (async page may follow)")
-		return `{"messages":[]}`, nil
-	}
-	log.Info().
-		Int64("thread", tk).
-		Int64("refTs", refTs).
-		Int("insert", len(tbl.LSInsertMessage)).
-		Int("upsert", len(tbl.LSUpsertMessage)).
-		Int("delThenIns", len(tbl.LSDeleteThenInsertMessage)).
-		Int("cursorLen", len(cursor)).
-		Msg("FETCHMSG: ExecuteTasks result (async page may also follow)")
 
-	imgByMsg, vidByMsg := b.collectAttachments(tbl)
-	xmaByMsg := b.collectXma(tbl)
-	ctaByMsg := b.collectCta(tbl)
-	replyByMsg := b.collectReplies(tbl)
-	// Pick up any contact names in this fetched table so group history resolves
-	// each sender's name (not the thread name).
-	b.harvestContacts(tbl)
-	// Capture reactions for these fetched (historical) messages too.
-	b.harvestReactions(tbl)
-	var msgs []map[string]any
-	addMsg := func(threadKey, senderId, timestampMs int64, messageId, text string) {
-		payload := map[string]any{
-			"threadKey":  threadKey,
-			"messageId":  messageId,
-			"senderId":   senderId,
-			"senderName": b.lookupContact(senderId),
-			"text":       text,
-			"timestamp":  timestampMs,
-			"isMe":       senderId == b.fbid,
+	const (
+		overallTimeout = 30 * time.Second
+		pageTimeout    = 8 * time.Second
+	)
+	deadline := time.After(overallTimeout)
+	reReq := 0
+
+Loop:
+	for {
+		select {
+		case <-bf.pageCh:
+			n, minId, minTs, hasMore, _ := bf.snapshot()
+			if !hasMore {
+				break Loop // reached the top of the thread
+			}
+			if want > 0 && n >= want {
+				break Loop // collected the requested batch
+			}
+			if minId == "" || minTs == 0 {
+				break Loop // no next anchor to page with
+			}
+			// Room left and more history exists — page the next-older batch.
+			if err := fire(minId, minTs); err != nil {
+				break Loop
+			}
+		case <-time.After(pageTimeout):
+			// No page within the window. Re-request once from the original anchor,
+			// then give up and return what we have (the phone retries on next scroll).
+			if reReq == 0 {
+				reReq++
+				_ = fire(refMsgId, refTs)
+				continue
+			}
+			break Loop
+		case <-deadline:
+			break Loop
+		case <-b.ctx.Done():
+			return "", b.ctx.Err()
 		}
-		tagMedia(payload, messageId, text, imgByMsg, vidByMsg, xmaByMsg, ctaByMsg)
-		if rc, ok := replyByMsg[messageId]; ok {
-			payload["replyToId"] = rc.id
-			payload["replyToSender"] = b.lookupContact(rc.userId)
-			payload["replyToText"] = rc.text
-			payload["replyToIsMe"] = rc.userId == b.fbid
+	}
+
+	msgs := bf.collected()
+	// Oldest-first for the phone's MessageStore.merge (it re-sorts anyway, but the
+	// contract is oldest-first). Sort by timestamp ascending, id as tiebreak.
+	sort.SliceStable(msgs, func(i, j int) bool {
+		ti, _ := msgs[i]["timestamp"].(int64)
+		tj, _ := msgs[j]["timestamp"].(int64)
+		if ti != tj {
+			return ti < tj
 		}
-		msgs = append(msgs, payload)
-	}
-	for _, m := range tbl.LSInsertMessage {
-		addMsg(m.ThreadKey, m.SenderId, m.TimestampMs, m.MessageId, m.Text)
-	}
-	for _, m := range tbl.LSUpsertMessage {
-		addMsg(m.ThreadKey, m.SenderId, m.TimestampMs, m.MessageId, m.Text)
-	}
-	for _, m := range tbl.LSDeleteThenInsertMessage {
-		addMsg(m.ThreadKey, m.SenderId, m.TimestampMs, m.MessageId, m.Text)
-	}
-	bytes, err := json.Marshal(map[string]any{
-		"messages": msgs,
-		// Debug: when empty, the row counts tell us if the table had message rows
-		// at all (zero across all three strongly implies an E2EE thread whose
-		// content isn't in the Lightspeed table). Surfaced in the JSON so it shows
-		// up in the Kotlin-side log without needing a GoLog/adb capture.
-		"_dbg": fmt.Sprintf("ins=%d ups=%d dti=%d cur=%d",
-			len(tbl.LSInsertMessage), len(tbl.LSUpsertMessage),
-			len(tbl.LSDeleteThenInsertMessage), len(cursor)),
+		return fmt.Sprint(msgs[i]["messageId"]) < fmt.Sprint(msgs[j]["messageId"])
 	})
+
+	n, minId, minTs, hasMore, gotRange := bf.snapshot()
+	// Advance the fallback anchor so a later fetch arriving without a Kotlin cursor
+	// still pages from the new floor.
+	if minId != "" && minTs > 0 {
+		b.oldestMu.Lock()
+		b.oldestSeen[tk] = fbAnchor{MsgId: minId, TsMs: minTs}
+		b.oldestMu.Unlock()
+	}
+
+	exhausted := gotRange && !hasMore
+	out := map[string]any{
+		"messages":  msgs,
+		"exhausted": exhausted,
+		// Temporary diagnostic — strip once real hardware confirms rows land.
+		"_dbg": fmt.Sprintf("got=%d want=%d hasMore=%t gotRange=%t minTs=%d reReq=%d",
+			n, want, hasMore, gotRange, minTs, reReq),
+	}
+	if !exhausted && minId != "" && minTs > 0 {
+		out["cursor"] = map[string]any{
+			"referenceMessageId":   minId,
+			"referenceTimestampMs": minTs,
+		}
+	}
+	bytes, err := json.Marshal(out)
 	if err != nil {
 		return "", err
 	}
@@ -1513,7 +3626,7 @@ func (b *Bridge) sendCookieReaction(tk int64, targetMsgId, emoji string) (string
 }
 
 // SendMessage sends a text message to a thread. Encrypted (Messenger-over-
-// WhatsApp) threads — the ones the cookie path can't write to, e.g. the wife's
+// WhatsApp) threads — the ones the cookie path can't write to, e.g. a 1:1
 // chat — route through the whatsmeow E2EE client via SendFBMessage. Non-encrypted
 // cookie threads send via messagix's SendMessageTask (sendCookieText below) —
 // this is what makes Instagram (all non-E2EE) and non-E2EE Messenger threads
@@ -1567,7 +3680,7 @@ func (b *Bridge) SendMessage(threadKey, text string) (string, error) {
 // is whether the message being reacted to was sent by us (part of the message key).
 // Cookie (non-E2EE) threads react via messagix's SendReactionTask (sendCookieReaction).
 //
-// Built for 1:1 threads (e.g. the wife's chat). Group reactions would also need the
+// Built for 1:1 threads (e.g. a 1:1 chat). Group reactions would also need the
 // original sender as the key Participant; not wired yet.
 func (b *Bridge) SendReaction(threadKey, targetMsgId string, targetFromMe bool, emoji string) (string, error) {
 	tk, err := parseInt64(threadKey)
@@ -1621,6 +3734,43 @@ func (b *Bridge) SendReaction(threadKey, targetMsgId string, targetFromMe bool, 
 		return "", fmt.Errorf("SendFBMessage(reaction): %w", err)
 	}
 	out, _ := json.Marshal(map[string]string{"messageId": string(resp.ID)})
+	return string(out), nil
+}
+
+// MarkThreadRead marks a thread read on Facebook up to its latest activity.
+// Messenger marks read by a WATERMARK TIMESTAMP (ms), not by message id, so the
+// messageID the caller passes is intentionally unused here — we mark the whole
+// thread read as of its newest known activity. That timestamp is the same
+// LastActivityTimestampMs we already capture per thread (threadActivity); if we
+// have no entry yet, "now" is a safe watermark (you're looking at the thread, so
+// everything up to now is read). Runs the messagix ThreadMarkReadTask through the
+// same ExecuteTasks path sendCookieText/sendCookieReaction use.
+func (b *Bridge) MarkThreadRead(threadKey, messageID string) (string, error) {
+	tk, err := parseInt64(threadKey)
+	if err != nil {
+		return "", fmt.Errorf("bad thread key %q: %w", threadKey, err)
+	}
+	b.mu.Lock()
+	client := b.client
+	b.mu.Unlock()
+	if client == nil {
+		return "", fmt.Errorf("messagix client not connected")
+	}
+	b.taMu.Lock()
+	watermark := b.threadActivity[tk]
+	b.taMu.Unlock()
+	if watermark == 0 {
+		watermark = time.Now().UnixMilli()
+	}
+	_, err = client.ExecuteTasks(b.ctx, &socket.ThreadMarkReadTask{
+		ThreadId:            tk,
+		LastReadWatermarkTs: watermark,
+		SyncGroup:           1,
+	})
+	if err != nil {
+		return "", fmt.Errorf("ExecuteTasks(markRead): %w", err)
+	}
+	out, _ := json.Marshal(map[string]int64{"threadId": tk, "watermarkTs": watermark})
 	return string(out), nil
 }
 
@@ -1812,7 +3962,7 @@ func (b *Bridge) scheduleGhostReconnect(detail string) {
 	b.reconnectMu.Unlock()
 
 	b.emit("FBRECON", fmt.Sprintf(`{"step":"scheduled","reason":"code24","delay_s":%d,"detail":%q}`,
-		int(delay/time.Second), detail))
+		int(delay/time.Second), fbLogText(detail)))
 
 	go func() {
 		select {
@@ -1834,7 +3984,7 @@ func (b *Bridge) scheduleGhostReconnect(detail string) {
 			// LoadMessagesPage/Connect itself failed (e.g. network still down).
 			// Re-schedule with the already-escalated backoff. A successful connect
 			// will instead surface Event_Ready, which resets ghostRetries.
-			b.emit("FBRECON", fmt.Sprintf(`{"step":"reconnect_failed","error":%q}`, fmt.Sprintf("%v", err)))
+			b.emit("FBRECON", fmt.Sprintf(`{"step":"reconnect_failed","error":%q}`, fbLogText(fmt.Sprintf("%v", err))))
 			b.scheduleGhostReconnect("reconnect retry")
 		}
 		// On success, b.Connect() started a fresh messagix loop; its Event_Ready
@@ -1901,7 +4051,7 @@ func (b *Bridge) StartE2EE(storePath string) string {
 	// cookie inbox, so their conversation-list entry is created only when a live
 	// E2EE message arrives. Persist those entries and re-emit them on every
 	// connect so the thread survives an app restart/update without needing new
-	// activity (this is what made the wife's chat vanish after a reinstall).
+	// activity (this is what made a 1:1 chat vanish after a reinstall).
 	if _, terr := db.Exec(`CREATE TABLE IF NOT EXISTS mirror_e2ee_convo (thread_key INTEGER PRIMARY KEY, name TEXT, snippet TEXT, ts INTEGER)`); terr != nil {
 		b.emit("FBE2EE", fmt.Sprintf(`{"step":"convostore_init","status":"warn","detail":%q}`, terr.Error()))
 	}
@@ -1994,7 +4144,24 @@ func (b *Bridge) e2eeHandler(evt any) bool {
 		kind := "other"
 		text := ""
 		imageMime := ""
+		videoMime := ""
+		gifLike := false
+		posterData := ""
+		isSticker := false
+		audioMime := ""
+		var mediaParts []map[string]any // an album's pictures (two or more)
 		if ca := e.GetConsumerApplication(); ca != nil {
+			// Unsend: a revoke naming the message, in the payload's application data
+			// (not its content). Same UNSEND the cookie path emits; the phone puts
+			// the "deleted a message" line in the stored message's place.
+			if rv := ca.GetPayload().GetApplicationData().GetRevoke(); rv != nil {
+				if target := rv.GetKey().GetID(); target != "" {
+					if tk, perr := strconv.ParseInt(e.Info.Chat.User, 10, 64); perr == nil {
+						b.emit("UNSEND", map[string]any{"threadKey": tk, "messageId": target})
+					}
+				}
+				return true
+			}
 			content := ca.GetPayload().GetContent()
 			if mt := content.GetMessageText(); mt != nil {
 				kind = "consumer/text"
@@ -2044,24 +4211,134 @@ func (b *Bridge) e2eeHandler(evt any) bool {
 				} else {
 					kind = "consumer/image_decodefail"
 				}
-			} else if content.GetVideoMessage() != nil {
-				// Non-text content the watch can't yet fetch — show an accurate
-				// placeholder so it's never mislabeled or silently dropped. (Media
-				// download for these is a later enhancement.)
+			} else if vm := content.GetVideoMessage(); vm != nil {
+				// Video DM. Like images, the blob is encrypted media: retain the
+				// media transport keyed by message id and download+decrypt it only
+				// when the watch opens the video (DownloadMediaToFile). The inline
+				// JPEG thumbnail, when present and small, becomes the poster.
+				//
+				// Messenger also sends GIFs (the GIF picker's included) this way: a
+				// real GIF file in a video message, its mimetype image/gif. Like
+				// upstream, that's shown as the picture it is: an image, served by
+				// the image download (which animates a GIF), with the transport kept
+				// under the video-image key because it's encrypted with video keys.
 				kind = "consumer/video"
-				text = "[video]"
-			} else if content.GetStickerMessage() != nil {
+				text = vm.GetCaption().GetText()
+				if vt, derr := vm.Decode(); derr == nil {
+					if text == "" {
+						text = vt.GetAncillary().GetCaption().GetText()
+					}
+					wt := vt.GetIntegral().GetTransport()
+					mime := wt.GetAncillary().GetMimetype()
+					switch {
+					case wt.GetIntegral() == nil:
+						kind = "consumer/video_nointegral"
+					case strings.HasPrefix(mime, "image/"):
+						kind = "consumer/video_image"
+						imageMime = mime
+						b.retainE2EEImage(fbVideoImageKey(string(e.Info.ID)), wt.GetIntegral())
+					default:
+						videoMime = mime
+						if !strings.HasPrefix(videoMime, "video/") {
+							videoMime = "video/mp4"
+						}
+						gifLike = vt.GetAncillary().GetGifPlayback()
+						const maxPosterBytes = 8 * 1024
+						if th := wt.GetAncillary().GetThumbnail().GetJPEGThumbnail(); !gifLike && len(th) > 0 && len(th) <= maxPosterBytes {
+							posterData = base64.StdEncoding.EncodeToString(th)
+						}
+						b.retainE2EEVideo(string(e.Info.ID), wt)
+					}
+				} else {
+					kind = "consumer/video_decodefail"
+				}
+				if text == "" && imageMime == "" {
+					text = "[Video]"
+				}
+			} else if sm := content.GetStickerMessage(); sm != nil {
+				// Sticker DM. Encrypted media like a photo (downloaded with image
+				// keys, as Messenger does): retain its transport under the sticker
+				// key and show it as a picture, with no text under it. A sticker
+				// Meta only lets its own app fetch (a receiver fetch id, no file of
+				// its own) stays a "[sticker]" label, as upstream does.
 				kind = "consumer/sticker"
 				text = "[sticker]"
-			} else if content.GetAudioMessage() != nil {
+				if st, derr := sm.Decode(); derr == nil {
+					wt := st.GetIntegral().GetTransport()
+					integral := wt.GetIntegral()
+					switch {
+					case st.GetAncillary().GetReceiverFetchID() != "" || st.GetIntegral().GetReceiverFetchID() != "":
+						kind = "consumer/sticker_fetchid"
+					case integral == nil || integral.GetDirectPath() == "":
+						kind = "consumer/sticker_nointegral"
+					default:
+						text = ""
+						isSticker = true
+						imageMime = wt.GetAncillary().GetMimetype()
+						if !strings.HasPrefix(imageMime, "image/") {
+							imageMime = "image/webp"
+						}
+						b.retainE2EEImage(fbStickerKey(string(e.Info.ID)), integral)
+					}
+				} else {
+					kind = "consumer/sticker_decodefail"
+				}
+			} else if am := content.GetAudioMessage(); am != nil {
+				// Voice message (Messenger's apps don't mark voice notes apart from
+				// audio files; upstream treats them all as voice). Encrypted media
+				// like a video: the transport is kept under the audio key and
+				// DownloadMediaToFile decrypts it (audio keys) when the phone draws
+				// its card. The label stays as the text: the phone reads it as "no
+				// caption".
 				kind = "consumer/audio"
-				text = "[audio]"
+				text = "[Voice message]"
+				if at, derr := am.Decode(); derr == nil {
+					wt := at.GetIntegral().GetTransport()
+					if wt.GetIntegral() != nil && wt.GetIntegral().GetDirectPath() != "" {
+						audioMime = wt.GetAncillary().GetMimetype()
+						if !strings.HasPrefix(audioMime, "audio/") {
+							if at.GetIntegral().GetAudioFormat() == waMediaTransport.AudioTransport_Integral_OPUS {
+								audioMime = "audio/ogg"
+							} else {
+								audioMime = "audio/mp4"
+							}
+						}
+						b.retainE2EEAudio(string(e.Info.ID), wt)
+					} else {
+						kind = "consumer/audio_nointegral"
+					}
+				} else {
+					kind = "consumer/audio_decodefail"
+				}
 			} else if content.GetDocumentMessage() != nil {
 				kind = "consumer/document"
 				text = "[document]"
-			} else if content.GetExtendedTextMessage() != nil {
+			} else if et := content.GetExtendedTextMessage(); et != nil {
+				// A text with a link preview. It's the message: its words with the
+				// link in them, like a link message on any other network, so the
+				// phone's link-media lookup can find the link. When the words don't
+				// carry the link, the previewed address is added.
 				kind = "consumer/link"
-				text = "[link]"
+				text = et.GetText().GetText()
+				link := et.GetMatchedText()
+				if link == "" {
+					link = et.GetCanonicalURL()
+				}
+				link = fbWebURL(link)
+				if link != "" && !fbURLInText.MatchString(text) {
+					body := strings.TrimSpace(text)
+					switch {
+					case body != "":
+						text = body + "\n" + link
+					case et.GetTitle() != "" && et.GetTitle() != link:
+						text = link + "\n" + et.GetTitle()
+					default:
+						text = link
+					}
+				}
+				if strings.TrimSpace(text) == "" {
+					text = "[Link]"
+				}
 			} else if content.GetLocationMessage() != nil || content.GetLiveLocationMessage() != nil {
 				kind = "consumer/location"
 				text = "[location]"
@@ -2074,23 +4351,75 @@ func (b *Bridge) e2eeHandler(evt any) bool {
 			} else {
 				kind = "consumer/nontext"
 			}
-		} else if e.GetArmadillo() != nil {
-			kind = "armadillo"
+		} else if arm := e.GetArmadillo(); arm != nil {
+			if gal := arm.GetPayload().GetContent().GetImageGalleryMessage(); gal != nil {
+				// Several photos sent together (an album): one message whose pictures
+				// are kept like a photo's, each under its own key (fbPartKey), and
+				// listed in "media" for the adapter. A gallery that comes down to one
+				// picture is an ordinary photo; one with none left is a label.
+				kind = "armadillo/gallery"
+				if imgs, derr := gal.Decode(); derr == nil {
+					id := string(e.Info.ID)
+					for _, it := range imgs {
+						wt := it.GetIntegral().GetTransport()
+						integral := wt.GetIntegral()
+						if integral == nil || integral.GetDirectPath() == "" {
+							continue
+						}
+						mime := wt.GetAncillary().GetMimetype()
+						if !strings.HasPrefix(mime, "image/") {
+							mime = "image/jpeg"
+						}
+						key := fbPartKey(id, len(mediaParts))
+						b.retainE2EEImage(key, integral)
+						mediaParts = append(mediaParts, map[string]any{"kind": "image", "mime": mime, "id": key})
+					}
+				} else {
+					kind = "armadillo/gallery_decodefail"
+				}
+				switch len(mediaParts) {
+				case 0:
+					text = "[Photo]"
+				case 1:
+					imageMime, _ = mediaParts[0]["mime"].(string)
+					mediaParts = nil
+				}
+			} else {
+				text, kind = fbArmadilloText(arm)
+			}
+		}
+
+		// Album grouping for pictures and videos sent as separate messages: the
+		// message application's group id, set when the message is one of several
+		// (groupSize). The phone groups messages sharing it.
+		albumID := ""
+		md := e.FBApplication.GetMetadata()
+		if md.GetGroupSize() > 1 && md.GetGroupID() != "" {
+			albumID = md.GetGroupID()
 		}
 
 		// Diagnostic: KIND and character COUNT only — never the text itself (this
 		// log is sensitive).
-		b.emit("FBE2EE", fmt.Sprintf(`{"step":"MESSAGE","chat":%q,"sender":%q,"ts":%d,"kind":%q,"textLen":%d}`,
-			e.Info.Chat.String(), e.Info.Sender.String(), e.Info.Timestamp.Unix(), kind, len(text)))
+		diagMime := imageMime
+		if diagMime == "" {
+			diagMime = videoMime
+		}
+		if diagMime == "" {
+			diagMime = audioMime
+		}
+		b.emit("FBE2EE", fmt.Sprintf(`{"step":"MESSAGE","chat":%q,"sender":%q,"ts":%d,"kind":%q,"mime":%q,"parts":%d,"group":"%d/%d","textLen":%d}`,
+			e.Info.Chat.String(), e.Info.Sender.String(), e.Info.Timestamp.Unix(), kind, diagMime, len(mediaParts),
+			md.GetGroupIndex(), md.GetGroupSize(), len(text)))
 
 		// Route anything with renderable content — real text, a content-type
 		// placeholder, or an image — through the SAME MESSAGE/CONVERSATION emit
 		// shape the cookie bridge uses, so it lands in MessageStore and renders
 		// with no downstream or watch-side changes. Truly unknown/empty content
-		// (armadillo, unrecognized consumer types) is skipped rather than
-		// mislabeled. The @msgr JID's user part is the numeric thread/contact id
-		// used as our threadKey; the whatsmeow timestamp is converted to ms.
-		if text == "" && imageMime == "" {
+		// (unrecognized consumer types, Messenger-app messages other than share
+		// cards) is skipped rather than mislabeled; the log line above names it.
+		// The @msgr JID's user part is the numeric thread/contact id used as our
+		// threadKey; the whatsmeow timestamp is converted to ms.
+		if text == "" && imageMime == "" && len(mediaParts) == 0 {
 			return true
 		}
 		threadKey, err := strconv.ParseInt(e.Info.Chat.User, 10, 64)
@@ -2128,6 +4457,31 @@ func (b *Bridge) e2eeHandler(evt any) bool {
 			// mediaContent{format:IMAGE, mediaID:messageId} so the watch requests the
 			// image, routing back to DownloadImageForWatch by this same message id.
 			msgPayload["imageMime"] = imageMime
+		}
+		if len(mediaParts) > 0 {
+			// The cookie path's album list: one part per picture, each by its key.
+			msgPayload["media"] = mediaParts
+		}
+		if albumID != "" {
+			msgPayload["albumID"] = albumID
+		}
+		if videoMime != "" {
+			// Same video markers the cookie path emits; mapFlatMessage turns them
+			// into mediaContent{format:VIDEO, mediaID:messageId}, served by
+			// DownloadMediaToFile from the retained transport.
+			msgPayload["videoMime"] = videoMime
+			if gifLike {
+				msgPayload["gifLike"] = true
+			}
+			if posterData != "" {
+				msgPayload["posterData"] = posterData
+			}
+		}
+		if audioMime != "" {
+			// The cookie path's audio marker: mapFlatMessage turns it into
+			// mediaContent{format:AUDIO, mediaID:messageId}, served by
+			// DownloadMediaToFile from the retained transport.
+			msgPayload["audioMime"] = audioMime
 		}
 		// E2EE reply context: a quoted message lives in the MessageApplication
 		// metadata (not the content), as a QuotedMessage whose StanzaID is the
@@ -2169,11 +4523,22 @@ func (b *Bridge) e2eeHandler(evt any) bool {
 					name = e.Info.PushName
 				}
 			}
-			// The list snippet falls back to "[image]" for an uncaptioned photo so
-			// the row isn't blank, even though the message itself carries no caption.
+			// The list snippet falls back to "[image]" for an uncaptioned photo (and
+			// "[sticker]" for a sticker, "[GIF]" for a GIF) so the row isn't blank,
+			// even though the message itself carries no caption.
 			snippet := text
+			if snippet == "" && len(mediaParts) > 0 {
+				snippet = fmt.Sprintf("[%d photos]", len(mediaParts))
+			}
 			if snippet == "" && imageMime != "" {
-				snippet = "[image]"
+				switch {
+				case isSticker:
+					snippet = "[sticker]"
+				case imageMime == "image/gif":
+					snippet = "[GIF]"
+				default:
+					snippet = "[image]"
+				}
 			}
 			b.emit("CONVERSATION", map[string]any{
 				"threadKey":  threadKey,
@@ -2275,6 +4640,89 @@ func (b *Bridge) loadImgXport(messageId string) *waMediaTransport.WAMediaTranspo
 	}
 	var x waMediaTransport.WAMediaTransport_Integral
 	if err := proto.Unmarshal(blob, &x); err != nil {
+		return nil
+	}
+	return &x
+}
+
+// retainE2EEVideo stores a video message's full media transport (integral +
+// ancillary, so the file length is known up front) for lazy download. Bounded
+// FIFO in memory, and persisted to mirror_img_xport under the "v:" key so it
+// survives an app restart. Image keys are bare message ids, sticker keys "s:",
+// video-image keys "vi:" and audio keys "a:", so nothing collides.
+func (b *Bridge) retainE2EEVideo(messageId string, wt *waMediaTransport.WAMediaTransport) {
+	b.retainE2EEFile(fbVideoKey(messageId), wt, "vidstore_put")
+}
+
+// retainE2EEAudio is retainE2EEVideo for an audio message, under the "a:" key.
+func (b *Bridge) retainE2EEAudio(messageId string, wt *waMediaTransport.WAMediaTransport) {
+	b.retainE2EEFile(fbAudioKey(messageId), wt, "audstore_put")
+}
+
+// retainE2EEFile keeps a file's transport under key, in memory and in fbe2ee.db.
+func (b *Bridge) retainE2EEFile(key string, wt *waMediaTransport.WAMediaTransport, diagStep string) {
+	const maxRetained = 30
+	b.e2eeImgMu.Lock()
+	if b.e2eeVidXport == nil {
+		b.e2eeVidXport = make(map[string]*waMediaTransport.WAMediaTransport)
+	}
+	if _, exists := b.e2eeVidXport[key]; !exists {
+		b.e2eeVidOrder = append(b.e2eeVidOrder, key)
+		for len(b.e2eeVidOrder) > maxRetained {
+			old := b.e2eeVidOrder[0]
+			b.e2eeVidOrder = b.e2eeVidOrder[1:]
+			delete(b.e2eeVidXport, old)
+		}
+	}
+	b.e2eeVidXport[key] = wt
+	b.e2eeImgMu.Unlock()
+
+	b.e2eeMu.Lock()
+	db := b.e2eeDB
+	b.e2eeMu.Unlock()
+	if db == nil {
+		return
+	}
+	blob, err := proto.Marshal(wt)
+	if err != nil {
+		return
+	}
+	if _, err := db.Exec(`INSERT OR REPLACE INTO mirror_img_xport(message_id, transport) VALUES(?, ?)`, key, blob); err != nil {
+		b.emit("FBE2EE", fmt.Sprintf(`{"step":%q,"status":"warn","detail":%q}`, diagStep, err.Error()))
+	}
+}
+
+// lookupVidXport returns a retained E2EE video transport for messageId, from
+// memory or (after a restart) from fbe2ee.db. nil means "not an E2EE video".
+func (b *Bridge) lookupVidXport(messageId string) *waMediaTransport.WAMediaTransport {
+	return b.lookupFileXport(fbVideoKey(messageId))
+}
+
+// lookupAudXport is lookupVidXport for audio. nil means "not an E2EE audio".
+func (b *Bridge) lookupAudXport(messageId string) *waMediaTransport.WAMediaTransport {
+	return b.lookupFileXport(fbAudioKey(messageId))
+}
+
+// lookupFileXport finds a transport retainE2EEFile kept under key.
+func (b *Bridge) lookupFileXport(key string) *waMediaTransport.WAMediaTransport {
+	b.e2eeImgMu.Lock()
+	wt := b.e2eeVidXport[key]
+	b.e2eeImgMu.Unlock()
+	if wt != nil {
+		return wt
+	}
+	b.e2eeMu.Lock()
+	db := b.e2eeDB
+	b.e2eeMu.Unlock()
+	if db == nil {
+		return nil
+	}
+	var blob []byte
+	if err := db.QueryRow(`SELECT transport FROM mirror_img_xport WHERE message_id = ?`, key).Scan(&blob); err != nil {
+		return nil
+	}
+	var x waMediaTransport.WAMediaTransport
+	if err := proto.Unmarshal(blob, &x); err != nil || x.GetIntegral() == nil {
 		return nil
 	}
 	return &x

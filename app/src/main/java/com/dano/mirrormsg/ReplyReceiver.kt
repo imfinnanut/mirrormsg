@@ -46,9 +46,9 @@ class ReplyReceiver : BroadcastReceiver() {
         if (text.isNullOrEmpty()) return
         val appCtx = context.applicationContext
         Mirror.appContext = appCtx
-        LogStore.i("MirrorMsgSpike", "ReplyReceiver: reply to convo $convoId via ${ownerServiceId ?: "active"}: \"$text\"")
+        LogStore.i("MirrorMsgSpike", "ReplyReceiver: reply to convo $convoId via ${ownerServiceId ?: "active"}: ${text.length} chars")
         // Dismiss the notification now that it's been answered.
-        Notifier.cancel(appCtx)
+        Notifier.cancel(appCtx, convoId)
         val pending = goAsync()
         CoroutineScope(Dispatchers.IO).launch {
             try {

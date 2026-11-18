@@ -4,6 +4,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
 /**
@@ -99,7 +102,7 @@ object LiveRouter {
                 if (rMsgId.isNotEmpty() && applyGoogleReactions(m, rMsgId)) {
                     LogStore.i(TAG, "Google reactions updated for msg ${rMsgId.takeLast(8)} in convo $convoId")
                     Mirror.invalidateConvoList()
-                    PebbleListenerService.onLiveReaction(convoId)
+                    PebbleListenerService.onLiveReaction(convoId, rMsgId)
                 }
             }
 
@@ -112,17 +115,27 @@ object LiveRouter {
                 if (rMsgId.isNotEmpty() && m.has("reactions") && applyTelegramReactions(m, rMsgId)) {
                     LogStore.i(TAG, "Telegram reactions updated for msg ${rMsgId.takeLast(8)} in convo $convoId")
                     Mirror.invalidateConvoList()
-                    PebbleListenerService.onLiveReaction(convoId)
+                    PebbleListenerService.onLiveReaction(convoId, rMsgId)
                 }
             }
 
             if (changed > 0) {
                 LogStore.i(TAG, "Live message stored/updated for convo $convoId (added=$added changed=$changed)")
                 Mirror.invalidateConvoList()
-                // Always re-push the thread so a status progression that added
-                // media (image arriving in stages) reaches the watch — even when
-                // no brand-new messageID was added.
-                PebbleListenerService.onLiveMessage(convoId)
+                // Suppress the fresh thread push while this convo is in its backfill
+                // quiet window: the fetched older messages are re-emitted as MESSAGE
+                // events for ~1-2s after a backfill fetch, and pushing the newest span
+                // for them would jump the reader to the bottom mid-scroll. They're
+                // already merged into the store, so they'll appear on the next span.
+                val quietUntil = Mirror.backfillQuietUntil[convoId] ?: 0L
+                if (System.currentTimeMillis() < quietUntil) {
+                    LogStore.i(TAG, "Live push suppressed (backfill quiet window) for $convoId")
+                } else {
+                    // Always re-push the thread so a status progression that added
+                    // media (image arriving in stages) reaches the watch — even when
+                    // no brand-new messageID was added.
+                    PebbleListenerService.onLiveMessage(convoId)
+                }
 
                 val sp = m.optJSONObject("senderParticipant")
                 // Direction must NOT rely solely on senderParticipant.isMe: some
@@ -140,6 +153,9 @@ object LiveRouter {
                     m.optJSONObject("anotherMessageID")?.optString("messageID") ?: ""
                 }
                 val hasImage = messageHasImage(m)
+                // Every stage gets a chance to contribute the media reference,
+                // including stages that trigger no notification of their own.
+                if (hasImage) rememberMediaRef(msgId, m)
                 // RCS delivers a media message in stages: the FIRST stage has no
                 // mediaContent yet and carries status INCOMING_AUTO_DOWNLOADING
                 // (the phone is fetching the picture); a later stage flips to
@@ -197,7 +213,7 @@ object LiveRouter {
                             LogStore.i(TAG, "Holding notification for downloading media msg $msgId (mode=${Mirror.notifyMode})")
                         } else {
                             if (hasImage && msgId.isNotEmpty()) imageForceOpened.add(msgId)
-                            routeIncoming(convoId, sender, body, groupName, silent, hasImage, ownerServiceId, msgId)
+                            routeIncoming(convoId, sender, body, groupName, silent, hasImage, ownerServiceId, msgId, NotificationImages.refFor(m))
                         }
                     } else if (msgId.isNotEmpty() && heldForImage.contains(msgId)
                                && !imageForceOpened.contains(msgId)) {
@@ -208,7 +224,7 @@ object LiveRouter {
                             imageForceOpened.add(msgId)   // handled once
                             if (Mirror.notifyMode == Mirror.MODE_HYBRID) {
                                 LogStore.i(TAG, "Late image attach -> hybrid force-open for msg $msgId")
-                                routeIncoming(convoId, sender, body, groupName, silent, true, ownerServiceId, msgId)
+                                routeIncoming(convoId, sender, body, groupName, silent, true, ownerServiceId, msgId, NotificationImages.refFor(m))
                             } else {
                                 // Notify mode: still a notification (routeIncoming's
                                 // mode check prevents a force-open), but pass TRUE so
@@ -216,7 +232,7 @@ object LiveRouter {
                                 // then lands on the enhanced view (straight to the
                                 // picture) instead of the chat thread.
                                 LogStore.i(TAG, "Late image attach -> notify [Image] for msg $msgId")
-                                routeIncoming(convoId, sender, body, groupName, silent, true, ownerServiceId, msgId)
+                                routeIncoming(convoId, sender, body, groupName, silent, true, ownerServiceId, msgId, NotificationImages.refFor(m))
                             }
                         } else if (status == "INCOMING_COMPLETE") {
                             // Completed with no media after all -> notify text once.
@@ -385,7 +401,7 @@ object LiveRouter {
     }
 
     /** Route an incoming message per the selected notify mode. */
-    private fun routeIncoming(convoId: String, sender: String, body: String, groupName: String, silent: Boolean, hasImage: Boolean, ownerServiceId: String, msgId: String) {
+    private fun routeIncoming(convoId: String, sender: String, body: String, groupName: String, silent: Boolean, hasImage: Boolean, ownerServiceId: String, msgId: String, mediaRef: NotificationImages.Ref? = null) {
         val ctx = Mirror.appContext ?: return
         // Per-message silence from the source's own settings (e.g. a muted Discord
         // server/channel). Stored already, browsable on the watch — just no alert.
@@ -400,48 +416,263 @@ object LiveRouter {
             return
         }
         val mode = Mirror.notifyMode
-        // Force open?  Forced mode always; Hybrid only when an image arrived
-        // (images can't render in a Pebble notification).
-        val forceOpen = when (mode) {
+        // ONE decision -> ONE delivery. Every notify-worthy message gets exactly
+        // one of the two base behaviors (never both):
+        //   IAN  -> forceOpenWatch (the watch branches on its own view state:
+        //           same-chat list = quiet buzz / hold; anywhere else = detail view)
+        //   Pebble notification -> alerting Android notification, Pebble mirrors
+        //           it and does ALL the alerting; the watchapp stays passive.
+        // MODE_FORCE ("In-app notification"): always IAN — including launching the
+        //   watchapp when it's closed.
+        // MODE_HYBRID: an image is ALWAYS an IAN (can't render in a Pebble
+        //   notification — launches the app if closed, sub-option ignored); text
+        //   follows the notification path, honoring hybridIanWhenOpen.
+        // MODE_NOTIFY: Pebble notification always — unless notifyIanWhenOpen is on
+        //   AND the watchapp is currently open, then IAN.
+        // SAME-CHAT EXCEPTION (both notification-capable modes): a Pebble
+        //   notification must never pop over the conversation the user is actively
+        //   viewing. When the watch is open ON this convo's thread, deliver as an
+        //   IAN instead — the watch's own same-chat branch turns that into the
+        //   quiet double-buzz (follow at bottom / hold when scrolled up), i.e.
+        //   exactly the IAN in-chat behavior. currentOpenConvoId is kept honest by
+        //   KEY_REQ_OPEN (set on open), KEY_THREAD_CLOSED (cleared on back-out),
+        //   and onAppClosed (cleared), so a user browsing the convo list still
+        //   gets real Pebble notifications.
+        val watchOpen = Mirror.watchAppOpen
+        val sameChatOpen = watchOpen && convoId == Mirror.currentOpenConvoId
+        val ian = when (mode) {
             Mirror.MODE_FORCE  -> true
-            Mirror.MODE_HYBRID -> hasImage
-            else               -> false      // MODE_NOTIFY
+            Mirror.MODE_HYBRID -> hasImage || sameChatOpen || (Mirror.hybridIanWhenOpen && watchOpen)
+            else               -> sameChatOpen || (Mirror.notifyIanWhenOpen && watchOpen)   // MODE_NOTIFY
         }
-        if (forceOpen) {
-            // Forced mode and Hybrid+image both land on the ENHANCED view so the
-            // message (or image) is shown big immediately.
-            LogStore.i(TAG, "routeIncoming: force-open ENHANCED convo $convoId (mode=$mode, img=$hasImage, owner=$ownerServiceId)")
+        if (ian) {
+            LogStore.i(TAG, "routeIncoming: IAN convo $convoId (mode=$mode, img=$hasImage, watchOpen=$watchOpen, sameChat=$sameChatOpen, owner=$ownerServiceId)")
             forceOpenWatch(convoId, Schema.VIEW_ENHANCED, ownerServiceId)
         } else {
-            // Notification (and Hybrid text): normal notification -> chat view on tap.
-            LogStore.i(TAG, "routeIncoming: notification convo $convoId (mode=$mode)")
-            Notifier.postNewMessage(ctx, convoId, sender, body, ownerServiceId, msgId, groupName)
+            LogStore.i(TAG, "routeIncoming: pebble notification convo $convoId (mode=$mode, img=$hasImage, watchOpen=$watchOpen)")
+            // PebbleOS renders images attached to Android notifications, so a
+            // picture message must carry its picture — otherwise our notification
+            // shows "[Image]" where a Pebble-native one shows the photo, and the
+            // user's rational move is to turn MirrorMsg off.
+            //
+            // The fetch can touch the network, so it runs off-thread with a bounded
+            // wait: if the image isn't ready in time we post text-only rather than
+            // sitting on the notification. Posting late-but-with-picture is fine;
+            // never posting is not. (One post either way — a second post to update
+            // the same id would not re-alert, so Pebble would keep showing the
+            // text-only version anyway.)
+            val ref = if (hasImage) mediaRef else null
+            if (ref != null && ref.usable) {
+                CoroutineScope(Dispatchers.IO).launch {
+                    val t0 = System.currentTimeMillis()
+                    // ONE budget covers both halves — waiting for the reference and
+                    // fetching the image. Timing them separately would let a slow
+                    // message stack 4s of waiting on top of 5s of downloading, and a
+                    // notification that lands 9 seconds late is its own bug.
+                    val pic = withTimeoutOrNull(NOTIF_IMAGE_TIMEOUT_MS) {
+                        // If this stage had no downloadable reference, give the later
+                        // stage a moment to bring one; otherwise we'd notify with the
+                        // preview thumbnail and it renders as a blur.
+                        val best = if (ref.mediaId.isEmpty()) (awaitMediaRef(msgId, convoId, ref) ?: ref) else ref
+                        NotificationImages.bitmapFor(best, ownerServiceId, ctx)
+                    }
+                    val took = System.currentTimeMillis() - t0
+                    if (pic == null) {
+                        // Distinguish "timed out" from "returned nothing" — they have
+                        // completely different fixes and both used to look identical
+                        // in the log (a cancelled coroutine logs nothing at all).
+                        if (took >= NOTIF_IMAGE_TIMEOUT_MS)
+                            LogStore.w(TAG, "Notification image TIMED OUT after ${took}ms for $msgId — posting text-only")
+                        else
+                            LogStore.i(TAG, "Notification image unavailable (${took}ms) for $msgId — posting text-only")
+                    } else {
+                        LogStore.i(TAG, "Notification image ready in ${took}ms (${pic.width}x${pic.height}) for $msgId")
+                    }
+                    Notifier.postNewMessage(ctx, convoId, sender, body, ownerServiceId, msgId, groupName, pic)
+                    mediaRefs.remove(msgId)
+                }
+            } else if (LinkPictures.has(body)) {
+                // Step 109: a link with a picture behind it (an X / Reddit / Imgur /
+                // Instagram / Facebook post, a YouTube video, a GIF picker's link, a
+                // picture file) carries that picture too, looked up as the watch's
+                // chat would. Dan: a late notification with its picture beats a quick
+                // one without, so this waits up to LINK_IMAGE_TIMEOUT_MS.
+                CoroutineScope(Dispatchers.IO).launch {
+                    val t0 = System.currentTimeMillis()
+                    val pic = try {
+                        withTimeoutOrNull(LINK_IMAGE_TIMEOUT_MS) {
+                            LinkPictures.forText(ctx, body, LINK_IMAGE_TIMEOUT_MS - 1000L)
+                        }
+                    } catch (e: Throwable) {
+                        LogStore.w(TAG, "Link picture failed: ${e.javaClass.simpleName}")
+                        null
+                    }
+                    val took = System.currentTimeMillis() - t0
+                    if (pic == null) LogStore.i(TAG, "Link picture unavailable (${took}ms) for $msgId: posting text-only")
+                    else LogStore.i(TAG, "Link picture ready in ${took}ms (${pic.width}x${pic.height}) for $msgId")
+                    Notifier.postNewMessage(ctx, convoId, sender, body, ownerServiceId, msgId, groupName, pic)
+                }
+            } else {
+                Notifier.postNewMessage(ctx, convoId, sender, body, ownerServiceId, msgId, groupName)
+            }
+        }
+    }
+
+    // Serializes IAN sequences. A burst of notify-worthy messages fires one
+    // forceOpenWatch each (repeatable IANs are intended); without serialization
+    // their list-stream + thread-push sequences would interleave on the wire.
+    private val forceOpenMutex = Mutex()
+    // How long the debounced live repaint stays suppressed while an IAN sequence
+    // is in flight (safety ceiling — it's cleared early the moment the ENHANCED
+    // push has gone out). Covers the watchapp-launch delay + account switch +
+    // list stream + thread push with margin.
+    private const val FORCE_OPEN_QUIET_MS = 6000L
+    // How long a notification will wait on its picture before going out without
+    // one. Inline images return almost immediately; a downloaded one is a network
+    // round-trip, and past a few seconds a late notification is worse than a
+    // picture-less one.
+    // Total budget for producing a notification picture: waiting for the media
+    // reference to arrive PLUS downloading and decoding it. Past this the
+    // notification goes out text-only — late is worse than plain.
+    // Step 109 (Dan): a late notification with its picture beats a quick one
+    // without, so the budget is 15 s (was 7 s).
+    private const val NOTIF_IMAGE_TIMEOUT_MS = 15000L
+    // The same for a picture found behind a link (a post looked up first, then its
+    // picture downloaded).
+    private const val LINK_IMAGE_TIMEOUT_MS = 15000L
+    // How long a picture notification waits for the media reference to show up.
+    // RCS delivers an image message in stages: the stage that triggers the
+    // notification carries only a preview (measured: a 275x246 photo arrives as a
+    // 69x62 inline thumbnail with NO mediaID field at all), and the downloadable
+    // reference appears on a later stage. Posting immediately means posting a
+    // blur, so we wait — briefly — for the real reference.
+    private const val MEDIA_REF_WAIT_MS = 3000L
+    private const val MEDIA_REF_POLL_MS = 400L   // each poll reads the store file
+
+    /** Best media reference seen for a message id, recorded as stages arrive.
+     *  Bounded: image messages are rare relative to text, and entries are dropped
+     *  once used or when the map grows past a sane ceiling. */
+    private val mediaRefs = java.util.Collections.synchronizedMap(
+        object : LinkedHashMap<String, NotificationImages.Ref>(16, 0.75f, false) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, NotificationImages.Ref>?) = size > 64
+        })
+
+    /** Record a downloadable reference for [msgId] if this stage has one. Called
+     *  for EVERY live message stage, so whichever stage carries the id wins. */
+    private fun rememberMediaRef(msgId: String, m: JSONObject) {
+        if (msgId.isEmpty()) return
+        val ref = NotificationImages.refFor(m) ?: return
+        if (ref.mediaId.isEmpty()) return          // preview-only stage: nothing to record
+        val prev = mediaRefs[msgId]
+        if (prev == null || prev.mediaId.isEmpty()) {
+            mediaRefs[msgId] = ref
+            LogStore.i(TAG, "Media reference arrived for $msgId")
         }
     }
 
     /**
-     * Immediately force-open the watchapp, landing on the given view. ownerServiceId
-     * is the account that OWNS this convo — the force-open switches the watch's
-     * active account to it (so the rail + list + image serving all agree), then
-     * pushes the thread. This is the multi-account PN contract: a pseudo-notification
-     * makes its owning account active, always.
+     * Wait briefly for a downloadable media reference for [msgId], checking BOTH
+     * places one can appear:
+     *
+     *  - the live-stage map, for sources that deliver the reference on a later
+     *    MESSAGE event, and
+     *  - MessageStore, which is where Google Messages actually puts it. Verified
+     *    from logs: the notification-triggering stage carries no id field at all
+     *    (only a preview thumbnail), no later live event brings one either, and
+     *    yet the thread parser reads a 62-character mediaID from the store moments
+     *    afterwards. MessageStore.merge treats gaining a mediaID as a "richer"
+     *    version of the same message, so the id lands there when the fuller copy
+     *    arrives — via a path that never passes through this router.
+     *
+     * Returns the original preview-only ref if nothing shows up in time; a small
+     * picture beats none.
+     */
+    private suspend fun awaitMediaRef(msgId: String, convoId: String,
+                                      fallback: NotificationImages.Ref?): NotificationImages.Ref? {
+        if (msgId.isEmpty()) return fallback
+        val ctx = Mirror.appContext
+        val started = System.currentTimeMillis()
+        val deadline = started + MEDIA_REF_WAIT_MS
+        while (true) {
+            mediaRefs[msgId]?.let {
+                LogStore.i(TAG, "Media reference for $msgId from live stage after ${System.currentTimeMillis() - started}ms")
+                return it
+            }
+            if (ctx != null) {
+                storeRefFor(ctx, convoId, msgId)?.let {
+                    LogStore.i(TAG, "Media reference for $msgId from MessageStore after ${System.currentTimeMillis() - started}ms")
+                    return it
+                }
+            }
+            if (System.currentTimeMillis() >= deadline) break
+            delay(MEDIA_REF_POLL_MS)
+        }
+        LogStore.i(TAG, "No media reference for $msgId within ${MEDIA_REF_WAIT_MS}ms — using preview")
+        return fallback
+    }
+
+    /** The stored copy of [msgId], if it has gained a downloadable reference. */
+    private fun storeRefFor(ctx: android.content.Context, convoId: String, msgId: String): NotificationImages.Ref? {
+        return try {
+            val arr = MessageStore.load(ctx, convoId)
+            for (i in 0 until arr.length()) {
+                val m = arr.optJSONObject(i) ?: continue
+                val id = m.optString("messageID").ifEmpty {
+                    m.optJSONObject("anotherMessageID")?.optString("messageID") ?: ""
+                }
+                if (id != msgId) continue
+                val ref = NotificationImages.refFor(m)
+                return if (ref != null && ref.mediaId.isNotEmpty()) ref else null
+            }
+            null
+        } catch (e: Throwable) {
+            LogStore.w(TAG, "MessageStore lookup failed for $msgId: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Deliver an IAN: open the watchapp (if closed), landing on the given view.
+     * ownerServiceId is the account that OWNS this convo — the force-open switches
+     * the watch's active account to it (so the rail + list + image serving all
+     * agree), then pushes the thread. This is the multi-account IAN contract: an
+     * in-app notification makes its owning account active, always.
+     *
+     * The convo's debounced live repaint is suppressed for the duration
+     * (Mirror.forceOpenQuietUntil): it used to fire ~400ms in, BEFORE this
+     * sequence's ENHANCED push — a VIEW_CHAT fresh push that consumed the watch's
+     * new-message delta (killing the scrolled-up hold) and overwrote its thread
+     * token (turning a should-be IAN into a same-chat quiet buzz). The ENHANCED
+     * push streams the full thread itself, so nothing is lost by skipping it.
      */
     private fun forceOpenWatch(convoId: String, openView: Int = Schema.VIEW_CHAT,
                                ownerServiceId: String = Mirror.activeServiceId) {
         val ctx = Mirror.appContext ?: return
+        // Arm the repaint suppression BEFORE launching the coroutine, so a repaint
+        // debounce started by this same message can't slip through the gap.
+        Mirror.forceOpenQuietUntil[convoId] = System.currentTimeMillis() + FORCE_OPEN_QUIET_MS
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val sender = Mirror.sender(ctx)
-                Mirror.currentOpenConvoId = convoId
-                val launched = sender.startAppOnTheWatch(Schema.WATCH_UUID, watches = null)
-                LogStore.i(TAG, "forceOpenWatch startAppOnTheWatch -> $launched (view=$openView, owner=$ownerServiceId)")
-                delay(1200)
-                // Hand the whole PN sequence to the service: switch active account
-                // to the owner, refresh that account's list + rail, then push the
-                // enhanced frame carrying the convo's row index (KEY_PN_ROW).
-                PebbleListenerService.instance?.pushForceOpen(convoId, openView, ownerServiceId)
+                forceOpenMutex.withLock {
+                    val sender = Mirror.sender(ctx)
+                    Mirror.currentOpenConvoId = convoId
+                    val wasOpen = Mirror.watchAppOpen
+                    val launched = sender.startAppOnTheWatch(Schema.WATCH_UUID, watches = null)
+                    LogStore.i(TAG, "forceOpenWatch startAppOnTheWatch -> $launched (view=$openView, owner=$ownerServiceId, wasOpen=$wasOpen)")
+                    // The launch handshake only needs real time when the watchapp was
+                    // closed; when it's already open a short settle keeps the IAN snappy.
+                    delay(if (wasOpen) 250 else 1200)
+                    // Hand the whole IAN sequence to the service: switch active account
+                    // to the owner, refresh that account's list + rail, then push the
+                    // enhanced frame carrying the convo's row index (KEY_PN_ROW).
+                    PebbleListenerService.instance?.pushForceOpen(convoId, openView, ownerServiceId)
+                }
             } catch (e: Exception) {
                 LogStore.e(TAG, "forceOpenWatch failed", e)
+            } finally {
+                // ENHANCED push is out (or failed) — lift the suppression so later
+                // stages of this message (image attach) repaint normally.
+                Mirror.forceOpenQuietUntil[convoId] = 0L
             }
         }
     }

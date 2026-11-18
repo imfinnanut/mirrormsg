@@ -20,7 +20,7 @@ import java.io.File
  */
 object MessageStore {
     private const val TAG = "MirrorMsgSpike"
-    private const val MAX_PER_CONVO = 200
+    private const val MAX_PER_CONVO = 1000
 
     private fun dir(ctx: Context): File =
         File(ctx.filesDir, "threads").apply { if (!exists()) mkdirs() }
@@ -29,6 +29,20 @@ object MessageStore {
         // Sanitize convoID for filename (it can contain / etc.)
         val safe = convoId.replace(Regex("[^A-Za-z0-9_-]"), "_")
         return File(dir(ctx), "$safe.json")
+    }
+
+    /**
+     * A cheap version stamp for a convo's stored thread: the backing file's last-
+     * modified time XOR its length. Changes on every write (merge/mergeOne/store all
+     * rewrite the file), stays constant otherwise. Used to invalidate the parsed-
+     * thread cache deterministically — no JSON hashing, no collision risk. 0 if no
+     * file yet.
+     */
+    @Synchronized
+    fun threadVersion(ctx: Context, convoId: String): Long {
+        val f = fileFor(ctx, convoId)
+        if (!f.exists()) return 0L
+        return f.lastModified() xor (f.length() * 2654435761L)  // mix mtime + length
     }
 
     /** Load all stored messages for a conversation as a JSON array string. */
@@ -244,11 +258,43 @@ object MessageStore {
         }
         lastMergeChanged = changed
         lastMergeAdded = added
-        // Sort by timestamp ascending
-        val sorted = byId.values.sortedBy {
+        save(ctx, convoId, byId.values, "merge")
+        return added
+    }
+
+    /**
+     * Overwrite the stored message that has [message]'s messageID with [message],
+     * whatever either holds: unlike [merge], a copy without media replaces one with
+     * it (an unsent photo becomes its "deleted" line). Nothing happens when no stored
+     * message has that ID. Same dedupe, sort, cap and write as [merge]; sets
+     * [lastMergeChanged] (1 when replaced, else 0). Returns true when replaced.
+     */
+    @Synchronized
+    fun replace(ctx: Context, convoId: String, message: JSONObject): Boolean {
+        val id = msgId(message)
+        val existing = load(ctx, convoId)
+        val byId = LinkedHashMap<String, JSONObject>()
+        for (i in 0 until existing.length()) {
+            val m = existing.getJSONObject(i)
+            val mid = msgId(m)
+            if (mid.isNotEmpty()) byId[mid] = m
+        }
+        lastMergeAdded = 0
+        if (id.isEmpty() || !byId.containsKey(id)) {
+            lastMergeChanged = 0
+            return false
+        }
+        byId[id] = message
+        lastMergeChanged = 1
+        save(ctx, convoId, byId.values, "replace")
+        return true
+    }
+
+    /** Sort by timestamp ascending, keep the newest MAX_PER_CONVO, write the file. */
+    private fun save(ctx: Context, convoId: String, msgs: Collection<JSONObject>, op: String) {
+        val sorted = msgs.sortedBy {
             it.optString("timestamp").toLongOrNull() ?: 0L
         }
-        // Cap to most recent MAX_PER_CONVO
         val capped = if (sorted.size > MAX_PER_CONVO)
             sorted.subList(sorted.size - MAX_PER_CONVO, sorted.size) else sorted
         val out = JSONArray()
@@ -256,9 +302,8 @@ object MessageStore {
         try {
             fileFor(ctx, convoId).writeText(out.toString())
         } catch (e: Exception) {
-            Log.e(TAG, "MessageStore.merge write failed for $convoId", e)
+            Log.e(TAG, "MessageStore.$op write failed for $convoId", e)
         }
-        return added
     }
 
     /** Merge a single message object (from a live MESSAGE event). */
@@ -267,5 +312,11 @@ object MessageStore {
         val arr = JSONArray()
         arr.put(message)
         return merge(ctx, convoId, arr)
+    }
+
+    /** Delete every stored message of a conversation. */
+    @Synchronized
+    fun clear(ctx: Context, convoId: String) {
+        fileFor(ctx, convoId).delete()
     }
 }

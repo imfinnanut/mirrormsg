@@ -65,6 +65,13 @@ class MainActivity : Activity() {
     companion object {
         private const val TAG = "MirrorMsgSpike"
         private const val PREF_SESSION = "session"
+        // False only when the process is freshly (re)created — i.e. a cold start /
+        // launch-after-complete-close, NOT a foreground resume or config-change
+        // Activity recreation (companion statics survive those within one process).
+        // Used to reset sub-account "SHOW ALL" lamps to their dim/hidden default on
+        // cold start, so the lamp honestly reflects that late-arriving channels/folders
+        // aren't loaded yet (tap SHOW ALL reveals them once they arrive).
+        private var coldStartHandled = false
         private const val MAX_CONVOS = 15
         private const val SNIPPET_MAX = 60
 
@@ -161,8 +168,29 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         Mirror.appContext = applicationContext
         Mirror.loadSettings(this)
+        // Anchor the process. Before this, every network connection was
+        // established here and nothing kept the process alive afterwards, so
+        // Android reclaimed it after a few idle hours and notifications stopped
+        // until the app was reopened. Idempotent — a no-op if already running
+        // (e.g. started at boot, which is the normal case).
+        MirrorForegroundService.start(this)
         LogStore.init(this)
         ServiceRegistry.ensureLoaded(this)   // discover installed network modules
+        // On a COLD start (process (re)created), reset every sub-account "SHOW ALL"
+        // lamp to its dim/hidden default (0). Servers/folders (Discord, Telegram)
+        // arrive late after a force-close or update recovery, so a persisted green/
+        // yellow lamp would claim they're shown while the list is still empty. Dim =
+        // "they exist but are hidden"; tapping SHOW ALL reveals them once loaded. Runs
+        // once per process (coldStartHandled survives Activity recreation, resets on
+        // process death), so a foreground resume / rotation doesn't clobber the user's
+        // choice mid-session.
+        if (!coldStartHandled) {
+            coldStartHandled = true
+            for (svc in ServiceRegistry.available(this)) {
+                if (svc.id == "tgnative" || svc.id == "discord") setSubsShown(svc.id, 0)
+            }
+            LogStore.i(TAG, "Cold start: reset sub-account SHOW ALL lamps to hidden")
+        }
         activeTab = 0                        // land on Networks
         LogStore.i(TAG, "App started")
         startHeapTimer()
@@ -173,17 +201,23 @@ class MainActivity : Activity() {
                 requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 9001)
             }
         }
-        val saved = prefs.getString(PREF_SESSION, "") ?: ""
+        val saved = Vault.getString(prefs, PREF_SESSION)   // sealed in the Keystore
         if (saved.isNotEmpty()) {
             LogStore.i(TAG, "Found saved session — restoring, skipping login.")
             showHome("Restoring saved session\u2026")
             thread(name = "bridge-restore") { restoreAndConnect(saved) }
         } else {
-            // Logged out: show the normal tabbed UI (Accounts shows Google as
-            // signed-out). The WebView login only opens when the user taps
-            // "Sign in" on the Google account row.
-            LogStore.i(TAG, "No saved session — showing home (logged out).")
+            // Logged out of Google, but the app is serverless/unlocked and the other
+            // services (Facebook, Discord, Telegram, and all Beeper networks) have
+            // their OWN saved sessions. Connect them regardless of the Google session —
+            // otherwise every Beeper network stays read-only (no live ContentObserver/
+            // poll, no notifications), since those register inside connectIfPossible.
+            LogStore.i(TAG, "No saved Google session — connecting other registered services.")
             showHome("All accounts logged out")
+            thread(name = "svc-restore") {
+                connectRegisteredServices()
+                runOnUiThread { reportConnectionStatus() }
+            }
         }
         handleNotificationLaunch(intent)
     }
@@ -208,12 +242,15 @@ class MainActivity : Activity() {
 
     /**
      * If we were opened from a message notification ("Open on phone"), force-open
-     * the watchapp to the triggering conversation.
+     * the watchapp to the triggering conversation, on the account that owns it (the
+     * notification's EXTRA_SERVICE_ID, as OpenWatchReceiver does: never the active one,
+     * or the thread would open under whichever account the watch happened to show).
      */
     private fun handleNotificationLaunch(launchIntent: Intent?) {
         if (launchIntent?.getBooleanExtra(Notifier.EXTRA_FROM_NOTIF, false) != true) return
         val convoId = launchIntent.getStringExtra(Notifier.EXTRA_CONVO_ID) ?: return
-        LogStore.i(TAG, "Opened from notification for convo $convoId — opening watchapp")
+        val owner = launchIntent.getStringExtra(Notifier.EXTRA_SERVICE_ID)
+        LogStore.i(TAG, "Opened from notification for convo $convoId (owner=${owner ?: "?"}) — opening watchapp")
         // startAppOnTheWatch is a suspend fun, so run it in a coroutine.
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
             try {
@@ -222,9 +259,12 @@ class MainActivity : Activity() {
                 Mirror.currentOpenConvoId = convoId
                 val launched = sender.startAppOnTheWatch(Schema.WATCH_UUID, watches = null)
                 LogStore.i(TAG, "startAppOnTheWatch -> $launched")
-                // Give the watchapp a moment to boot, then push this thread.
+                // Give the watchapp a moment to boot, then push this thread: on its own
+                // account (switching to it) when the notification says which.
                 kotlinx.coroutines.delay(1200)
-                PebbleListenerService.instance?.pushThreadUpdate(convoId)
+                val pls = PebbleListenerService.instance
+                if (owner != null) pls?.pushForceOpen(convoId, Schema.VIEW_CHAT, owner)
+                else pls?.pushThreadUpdate(convoId)
             } catch (e: Exception) {
                 LogStore.e(TAG, "notification watch-open failed", e)
             }
@@ -416,17 +456,10 @@ class MainActivity : Activity() {
     // ---- Settings tab -----------------------------------------------------
 
     private fun buildSettingsTab(c: LinearLayout, p: Palette) {
-        // ON NEW MESSAGE — selectable mode cards.
-        sectionLabel(c, p, "On new message", first = true)
-        addModeCard(c, p, Mirror.MODE_NOTIFY, "Notification",
-            "Pebble shows a notification; tap to open the message")
-        addModeCard(c, p, Mirror.MODE_FORCE, "Force open",
-            "Jump straight to the message on your Pebble")
-        addModeCard(c, p, Mirror.MODE_HYBRID, "Hybrid",
-            "Notify for texts, force open for pictures")
-
-        // QUICK REPLIES — opens the editor. (Above Watch settings.)
-        sectionLabel(c, p, "Quick replies")
+        // QUICK REPLIES — opens the editor. (Above Watch settings.) "On new
+        // message" used to lead this tab; it now lives on the Status tab, between
+        // Status and Permissions.
+        sectionLabel(c, p, "Quick replies", first = true)
         val qrCard = card(p)
         val qrRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -466,15 +499,51 @@ class MainActivity : Activity() {
             Mirror.setEmojiSubstitution(this, on)
             pushConversationsToWatch()
         }
+        if (Media.engine.playsVideo) {
+            addDivider(setCard, p)
+            // How much of the link a video's sound takes (whether it plays is the watch's
+            // sound switch: beside a video's poster, and on the video). See Mirror.videoSoundLow.
+            addChoiceRow(setCard, p, "Video sound quality",
+                "Low sends half the sound data (duller), leaving more of the link to the picture",
+                listOf("Standard", "Low"), if (Mirror.videoSoundLow) 1 else 0) { pick ->
+                Mirror.setVideoSoundLow(this, pick == 1)
+            }
+        }
         addDivider(setCard, p)
-        addThumbLimitRow(setCard, p)
+        // The Time 2's sound when a message pops up on the watch (steps 89, 91), and with
+        // it the message's video plays with sound when the watch's video sound is on (Off:
+        // it starts silent). Picking one plays it there; the watch's mute and Quiet Time
+        // still silence it. The watch's account switcher turns it off and on too (its bell
+        // row), and this picker follows.
+        // Which sound (Off is in the row below). Picking one turns the sound on and plays it.
+        val showTone = addChoiceRow(setCard, p, "Notification sound",
+            "The Pebble Time 2 plays this when a message pops up, and its video plays with sound unless videos are muted on the watch",
+            Mirror.TONE_NAMES.drop(1), Mirror.lastTone - 1) { pick ->
+            Mirror.setPushTone(this, pick + 1)
+            PebbleListenerService.instance?.sendSound(play = true)
+        }
         addDivider(setCard, p)
-        addHeapGuardRow(setCard, p)
+        // How loud, or off (step 111): one setting with the watch's sound row at the top of
+        // its account switcher, which steps through the same four; this row follows it.
+        val showLevel = addChoiceRow(setCard, p, "Notification sound volume",
+            "How loud, within the watch's own speaker volume. The top of the watch's account switcher changes it too",
+            Mirror.TONE_LEVEL_NAMES, Mirror.toneLevel()) { pick ->
+            Mirror.setToneLevel(this, pick)
+            PebbleListenerService.instance?.sendSound(play = Mirror.pushTone > 0)
+        }
+        Mirror.onSoundChanged = { runOnUiThread { showTone(Mirror.lastTone - 1); showLevel(Mirror.toneLevel()) } }
+        // "Cached thumbnails" and "Image memory reserve" are gone: the watch's
+        // media pool decides what stays in memory now.
         c.addView(setCard)
 
         // ---- IMAGE QUALITY ------------------------------------------------
         sectionLabel(c, p, "Image quality")
         val iqCard = card(p)
+        // Animate adds/removes inside this card so the compressibility dial slides
+        // in and the rows below it push down smoothly, instead of snapping.
+        iqCard.layoutTransition = android.animation.LayoutTransition().apply {
+            enableTransitionType(android.animation.LayoutTransition.CHANGING)
+        }
         iqCard.addView(TextView(this).apply {
             text = "Images use as many colors as they need, up to a limit. " +
                 "The sliders decide how readily a busy image settles for fewer " +
@@ -501,7 +570,14 @@ class MainActivity : Activity() {
         addDivider(iqCard, p)
         addToggleRow(iqCard, p, "Compress large images",
             "Keep full-size images compressed in watch memory so bigger images fit.",
-            Mirror.imgCompress) { on -> Mirror.setImgCompress(this, on) }
+            Mirror.imgCompress) { on ->
+            Mirror.setImgCompress(this, on)
+            // Show/hide the compressibility dial IN PLACE — same approach as the
+            // Beeper master switch. Re-rendering the tab instead made the whole
+            // settings list flicker and jump the scroll position.
+            compressDitherRow?.visibility =
+                if (on) android.view.View.VISIBLE else android.view.View.GONE
+        }
         addDivider(iqCard, p)
         addDitherSection(iqCard, p)
         c.addView(iqCard)
@@ -511,6 +587,12 @@ class MainActivity : Activity() {
     // intensity). Simulates more colours on smooth gradients by blending palette
     // colours, at a compression cost — so it's opt-in. The sliders are disabled
     // (greyed) until the switch is on.
+    // The compressibility dial, held so the compression switch can show/hide it in
+    // place. Rebuilt on each render of the settings tab; cleared implicitly when
+    // that tab is rebuilt, and only ever touched from the compression switch's
+    // listener while the same tab is on screen.
+    private var compressDitherRow: android.view.View? = null
+
     private fun addDitherSection(parent: LinearLayout, p: Palette) {
         val sliders = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         fun setEnabled(on: Boolean) {
@@ -525,16 +607,27 @@ class MainActivity : Activity() {
             "Blend palette colors to smooth gradients and simulate more colors. " +
             "Flat areas and hard edges stay crisp.",
             Mirror.imgDither) { on -> Mirror.setImgDither(this, on); setEnabled(on) }
-        addSliderRow(sliders, p, "Edge protection",
-            "Higher keeps more edges crisp.", Mirror.imgDitherEdge,
-            "softer  \u2190          \u2192  crisper") { v -> Mirror.setImgDitherEdge(this, v) }
+        // Only meaningful alongside compression: this dial trades dithering away to
+        // keep long runs of identical pixels intact for the compressor. With
+        // compression off there is nothing to preserve, so the encoder dithers the
+        // whole image and the dial is hidden rather than shown doing nothing.
+        // It's built ALWAYS and kept in the layout with its visibility toggled, so
+        // the compression switch reveals it in place (no re-render, no flicker,
+        // no scroll jump) — the same technique the Beeper master switch uses.
+        val compressRow = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        addSliderRow(compressRow, p, "Keep images compressible",
+            "Leaves flat areas and hard edges undithered so images compress smaller. " +
+            "Lower means smoother gradients but larger transfers.",
+            Mirror.imgDitherCompress,
+            "smoother  \u2190          \u2192  smaller") { v -> Mirror.setImgDitherCompress(this, v) }
+        compressRow.visibility =
+            if (Mirror.imgCompress) android.view.View.VISIBLE else android.view.View.GONE
+        compressDitherRow = compressRow
+        sliders.addView(compressRow)
         addSliderRow(sliders, p, "Dither strength",
-            "Higher dithers more of the image.", Mirror.imgDitherStrength,
-            "less  \u2190          \u2192  more") { v -> Mirror.setImgDitherStrength(this, v) }
-        addSliderRow(sliders, p, "Dither intensity",
             "Higher = stronger texture; lower = softer and more compressible.",
             Mirror.imgDitherIntensity,
-            "soft  \u2190          \u2192  strong") { v -> Mirror.setImgDitherIntensity(this, v) }
+            "lite  \u2190          \u2192  strong") { v -> Mirror.setImgDitherIntensity(this, v) }
         parent.addView(sliders)
         setEnabled(Mirror.imgDither)
     }
@@ -1302,6 +1395,35 @@ class MainActivity : Activity() {
         parent.addView(row)
     }
 
+    // An indented on/off row shown directly under its mode card — the mode's
+    // sub-option. Title only, no subtitle: the mode card above it already explains
+    // the mode, and the switch reads as an on/off of the label itself.
+    private fun addModeSubToggle(parent: LinearLayout, p: Palette, title: String,
+                                 initial: Boolean, onChange: (Boolean) -> Unit) {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = rounded(p.card, 12, 1, p.cardBorder)
+            setPadding(dp(14), dp(6), dp(14), dp(6))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(6); leftMargin = dp(28)
+            }
+        }
+        val label = TextView(this).apply {
+            text = title; textSize = 14f; setTextColor(p.text)
+        }
+        val sw = Switch(this).apply {
+            isChecked = initial
+            setOnCheckedChangeListener { _, c -> onChange(c) }
+        }
+        row.addView(label, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(sw)
+        parent.addView(row)
+    }
+
     // Blend `over` onto `under` by alpha fraction (for the selected tint).
     private fun tint(over: Int, under: Int, frac: Float): Int {
         fun mix(a: Int, b: Int) = (a * frac + b * (1 - frac)).toInt()
@@ -1335,54 +1457,6 @@ class MainActivity : Activity() {
         parent.addView(row)
     }
 
-    // Dropdown row for the watch thumbnail-cache count (0-6). Selecting persists
-    // it and re-pushes so the watch resizes its thumbnail cache.
-    private fun addThumbLimitRow(parent: LinearLayout, p: Palette) {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(8), 0, dp(8))
-        }
-        val txt = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        txt.addView(TextView(this).apply {
-            text = "Cached thumbnails"; textSize = 16f; setTextColor(p.text)
-        })
-        txt.addView(TextView(this).apply {
-            text = "How many chat-view image previews the watch keeps loaded (0\u20138)."
-            textSize = 13f; setTextColor(p.subtext)
-        })
-        val spinner = android.widget.Spinner(this).apply {
-            val items = (0..8).map { it.toString() }
-            adapter = android.widget.ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item, items)
-            setSelection(Mirror.thumbLimit.coerceIn(0, 8))
-            onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(parent: android.widget.AdapterView<*>?,
-                                            view: android.view.View?, pos: Int, id: Long) {
-                    if (pos != Mirror.thumbLimit) {
-                        Mirror.setThumbLimit(this@MainActivity, pos)
-                        pushConversationsToWatch()
-                    }
-                }
-                override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
-            }
-        }
-        row.addView(txt, LinearLayout.LayoutParams(0,
-            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        row.addView(spinner, LinearLayout.LayoutParams(dp(96),
-            ViewGroup.LayoutParams.WRAP_CONTENT))
-        parent.addView(row)
-    }
-
-    // Dropdown row for the watch's image memory reserve. Before allocating each
-    // image bitmap, the watch keeps at least this many bytes of heap free —
-    // dumping its convo/thumbnail caches to stay above the line, and showing a
-    // placeholder instead of crashing if an image still won't fit. Higher = more
-    // aggressive cache dumping but safer; lower keeps the cache longer but
-    // declines more images under pressure. The watch hard-clamps the effective
-    // floor to a 600-byte minimum, so "Off" just means minimal protection.
-    // Part of the same memory-tuning family as the two cache limits above.
     // ---- Image quality helper rows ----------------------------------------
     // Colour-cap picker: a small spinner of 2 / 4 / 16 (the three watch-supported
     // palette sizes). onPick gets the chosen colour COUNT.
@@ -1423,6 +1497,49 @@ class MainActivity : Activity() {
         row.addView(spinner, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         parent.addView(row)
+    }
+
+    // A setting with a few named choices: title and subtitle, and a dropdown on the right.
+    // Returns a setter that shows another choice without calling onPick (the setting
+    // changed elsewhere).
+    private fun addChoiceRow(parent: LinearLayout, p: Palette, title: String, subtitle: String,
+                             labels: List<String>, current: Int, onPick: (Int) -> Unit): (Int) -> Unit {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        val txt = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        txt.addView(TextView(this).apply {
+            text = title; textSize = 16f; setTextColor(p.text)
+        })
+        txt.addView(TextView(this).apply {
+            text = subtitle; textSize = 13f; setTextColor(p.subtext)
+        })
+        var shown = current
+        val spinner = android.widget.Spinner(this).apply {
+            adapter = android.widget.ArrayAdapter(
+                this@MainActivity, android.R.layout.simple_spinner_dropdown_item, labels).apply {
+                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            }
+            setSelection(current.coerceIn(0, labels.size - 1))
+            onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: android.widget.AdapterView<*>?,
+                                            view: android.view.View?, pos: Int, id: Long) {
+                    if (pos != shown) { shown = pos; onPick(pos) }
+                }
+                override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+            }
+        }
+        row.addView(txt, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(spinner, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        parent.addView(row)
+        return { v ->
+            val c = v.coerceIn(0, labels.size - 1)
+            if (c != shown) { shown = c; spinner.setSelection(c) }
+        }
     }
 
     // Coverage slider: a SeekBar mapped to 10-100% with a live "fewer <-> more
@@ -1467,48 +1584,6 @@ class MainActivity : Activity() {
         }
         col.addView(caption)
         parent.addView(col)
-    }
-
-    private fun addHeapGuardRow(parent: LinearLayout, p: Palette) {
-        // Option values in bytes, and their human labels for the dropdown.
-        val values = listOf(0, 600, 800, 1000, 1500, 2000, 3000)
-        val labels = listOf("Off", "600 B", "800 B", "1 KB", "1.5 KB", "2 KB", "3 KB")
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(8), 0, dp(8))
-        }
-        val txt = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        txt.addView(TextView(this).apply {
-            text = "Image memory reserve"; textSize = 16f; setTextColor(p.text)
-        })
-        txt.addView(TextView(this).apply {
-            text = "Free memory the watch keeps in reserve for each image. It drops caches to stay above this, and shows a placeholder instead of crashing if an image still won't fit."
-            textSize = 13f; setTextColor(p.subtext)
-        })
-        val spinner = android.widget.Spinner(this).apply {
-            adapter = android.widget.ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item, labels)
-            val cur = values.indexOf(Mirror.heapGuard).let { if (it < 0) 2 else it }
-            setSelection(cur)
-            onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(parent: android.widget.AdapterView<*>?,
-                                            view: android.view.View?, pos: Int, id: Long) {
-                    val v = values[pos]
-                    if (v != Mirror.heapGuard) {
-                        Mirror.setHeapGuard(this@MainActivity, v)
-                        pushConversationsToWatch()
-                    }
-                }
-                override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
-            }
-        }
-        row.addView(txt, LinearLayout.LayoutParams(0,
-            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        row.addView(spinner, LinearLayout.LayoutParams(dp(96),
-            ViewGroup.LayoutParams.WRAP_CONTENT))
-        parent.addView(row)
     }
 
     /**
@@ -2080,22 +2155,42 @@ class MainActivity : Activity() {
             android.content.pm.PackageManager.PERMISSION_GRANTED
 
     /**
+     * "On new message" — the delivery-mode picker. Notification and Hybrid each
+     * carry a sub-option (in-app notifications while the watchapp is open),
+     * rendered as an indented toggle directly under its card and only while that
+     * mode is selected (the mode cards call renderHome, so it appears/disappears
+     * with the selection). Lives on the STATUS tab, between Status and
+     * Permissions — it's the behavior a user reaches for most, and it sits next to
+     * the notification permission it depends on.
+     */
+    private fun buildOnNewMessageSection(c: LinearLayout, p: Palette) {
+        sectionLabel(c, p, "On new message")
+        addModeCard(c, p, Mirror.MODE_NOTIFY, "Notification",
+            "Pebble shows a notification; tap to open the message")
+        if (Mirror.notifyMode == Mirror.MODE_NOTIFY)
+            addModeSubToggle(c, p, "In-app notifications while watchapp is open",
+                Mirror.notifyIanWhenOpen) { Mirror.setNotifyIanWhenOpen(this, it) }
+        addModeCard(c, p, Mirror.MODE_FORCE, "In-app notification",
+            "Jump straight to the message on your Pebble")
+        addModeCard(c, p, Mirror.MODE_HYBRID, "Hybrid",
+            "Notify for texts, jump to the message for pictures")
+        if (Mirror.notifyMode == Mirror.MODE_HYBRID)
+            addModeSubToggle(c, p, "In-app notifications while watchapp is open",
+                Mirror.hybridIanWhenOpen) { Mirror.setHybridIanWhenOpen(this, it) }
+    }
+
+    /**
      * Permissions section (notification posting/access, battery, and — only when
      * the Beeper app is installed — Beeper content-provider access).
      */
     private fun buildPermissionsSection(c: LinearLayout, p: Palette) {
         sectionLabel(c, p, "Permissions")
         val permCard = card(p)
+        // General permissions first (always relevant, Beeper or not).
         addCheckRow(permCard, p, "Notification posting",
             hasNotificationPermission(),
             "Lets MirrorMsg alert your Pebble on new messages") {
             openNotificationSettings()
-        }
-        addDivider(permCard, p)
-        addCheckRow(permCard, p, "Notification access",
-            hasNotificationListenerAccess(),
-            "Reads Beeper notifications so MirrorMsg can capture message images") {
-            openNotificationListenerSettings()
         }
         addDivider(permCard, p)
         addCheckRow(permCard, p, "Unrestricted battery",
@@ -2103,10 +2198,18 @@ class MainActivity : Activity() {
             "Keeps MirrorMsg running so messages arrive reliably") {
             requestBatteryUnrestricted()
         }
-        // Beeper access: only relevant (and only shown) when the Beeper app is
-        // installed. Both content-provider permissions are runtime-granted, so a
-        // tap requests them; onResume re-renders the row once the dialog closes.
+        // Beeper-specific permissions grouped together at the BOTTOM, and shown ONLY
+        // when the Beeper app is installed. Both are only meaningful with Beeper:
+        // "Notification access" reads Beeper notifications for message images, and
+        // "Beeper access" is the content-provider grant. Without Beeper they're noise,
+        // so hide both (previously only "Beeper access" was gated).
         if (isBeeperInstalled()) {
+            addDivider(permCard, p)
+            addCheckRow(permCard, p, "Notification access",
+                hasNotificationListenerAccess(),
+                "Reads Beeper notifications so MirrorMsg can capture message images") {
+                openNotificationListenerSettings()
+            }
             addDivider(permCard, p)
             addCheckRow(permCard, p, "Beeper access",
                 hasBeeperAccess(),
@@ -2174,6 +2277,8 @@ class MainActivity : Activity() {
             visibility = if (isHeadlineRedundant(statusMsg)) View.GONE else View.VISIBLE
         }.also { statusView = it })
         c.addView(statusCard)
+
+        buildOnNewMessageSection(c, p)
 
         buildPermissionsSection(c, p)
 
@@ -2602,6 +2707,19 @@ class MainActivity : Activity() {
     // ---- Restore path -------------------------------------------------
 
     private fun restoreAndConnect(savedSession: String) {
+        // The anchor service may already have restored Google headlessly (it runs
+        // at boot, with no Activity). Creating a second bridge here would open a
+        // SECOND long-poll on the same account and double-deliver every message,
+        // so adopt the existing one instead. (Interactive login is unaffected: it
+        // builds its own bridge through startWebViewLogin, which is what installs
+        // the UI-capable sink needed for the pairing emoji.)
+        val existing = Mirror.bridge
+        if (existing != null) {
+            LogStore.i(TAG, "Google bridge already live (headless restore) — adopting it.")
+            connectRegisteredServices()
+            runOnUiThread { reportConnectionStatus() }
+            return
+        }
         try {
             val b = Mirrorbridge.newBridge(savedSession, sink)
             Mirror.bridge = b
@@ -2615,25 +2733,37 @@ class MainActivity : Activity() {
             LogStore.e(TAG, "Restore failed; clearing google session.", e)
             prefs.edit().remove(PREF_SESSION).apply()
         }
-        // Restore every OTHER registered network (Facebook, etc.) that has a saved
-        // session. Google is handled above via Mirror.bridge; the rest go through
-        // the registry. Each service decides for itself whether it can connect
-        // (connectIfPossible reads its own saved session / cookies).
+        // Connect every other registered service, then report status. Split out so it
+        // can ALSO run when there's no Google session (serverless/unlocked boot) — see
+        // connectRegisteredServices.
+        connectRegisteredServices()
+        reportConnectionStatus()
+    }
+
+    /**
+     * Connect every registered NON-Google service (Facebook, Discord, Telegram, and
+     * all Beeper networks) via each service's own self-gating connectIfPossible(),
+     * which reads that service's own saved session/cookies and no-ops if it can't
+     * connect. This MUST run on every startup regardless of the Google session state:
+     * the app is serverless/unlocked, so a boot with no Google session still needs the
+     * Beeper live ContentObserver + poll (registered inside connectIfPossible) and the
+     * other services' connections brought up. Gating this behind the Google session
+     * left every Beeper network with no live updates or notifications (read-only).
+     */
+    private fun connectRegisteredServices() {
         try {
             for (svc in ServiceRegistry.available(this)) {
-                if (svc.id == "google") continue  // already restored above
+                if (svc.id == "google") continue  // Google restored via Mirror.bridge
                 try {
                     val ok = svc.connectIfPossible()
-                    LogStore.i(TAG, "Restore ${svc.id}: connectIfPossible=$ok")
+                    LogStore.i(TAG, "Connect ${svc.id}: connectIfPossible=$ok")
                 } catch (e: Throwable) {
-                    LogStore.e(TAG, "Restore ${svc.id} failed", e)
+                    LogStore.e(TAG, "Connect ${svc.id} failed", e)
                 }
             }
         } catch (e: Throwable) {
-            LogStore.e(TAG, "Multi-service restore failed", e)
+            LogStore.e(TAG, "Registered-service connect failed", e)
         }
-        // Report the TRUTH about what's connected, across all services.
-        reportConnectionStatus()
     }
 
     /**
@@ -2742,7 +2872,7 @@ class MainActivity : Activity() {
                 LogStore.i(TAG, "Gaia pairing — confirm the emoji on your phone…")
                 b.startGaiaPairing()
                 val s = b.exportSession()
-                prefs.edit().putString(PREF_SESSION, s).apply()
+                Vault.putString(prefs, PREF_SESSION, s)   // sealed in the Keystore
                 LogStore.i(TAG, "Paired and session saved (${s.length} chars).")
                 b.connect()
                 LogStore.i(TAG, "Connected.")
@@ -2758,6 +2888,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        Mirror.onSoundChanged = null   // the Settings picker goes with this screen
         webView?.destroy()
         // Leave Mirror.bridge alive — PebbleListenerService may still need it.
         super.onDestroy()

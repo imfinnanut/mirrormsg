@@ -15,6 +15,8 @@ class BeeperSignalService : BeeperServiceBase() {
     override val id = "signal"
     override val displayName = "Signal"
     override val protocol = "signal"
+    // Twin of native Signal (id "signalnative"): same group, so only one is on.
+    override val conflictGroup = "signal"
 
     // Avatar circle colors (Signal blue family). All under ~140 luma -> white
     // initials.

@@ -35,8 +35,9 @@ import java.io.FileOutputStream
  *    the cached image that belongs to it and emit the `mediaContent` marker the
  *    watch uses to request it. The cache key travels as mediaID (opaque).
  *  - SERVE [scaleForWatch]: on REQ_IMAGE, load the cached PNG and run it through
- *    the Go scaler (borrowed off [Mirror.bridge] — the scale/pack is pure pixel
- *    math, no Google session) to produce the watch's {w,h,pixels,fmt,palette}.
+ *    the standalone watchimage scaler (bridge-independent package-level static, so
+ *    it works with no Google session / null Mirror.bridge — Beeper is serverless)
+ *    to produce the watch's {w,h,pixels,fmt,palette}.
  *
  * Images are caught LIVE: we only have the picture for a message that notified
  * while the listener was connected; history/backfill and muted-chat images are
@@ -291,7 +292,7 @@ object BeeperImages {
      * The scale + 4bpp-palette pack is done by the Go mirrorbridge's
      * ProcessInlineImageForWatch, which is pure pixel math (no session/client
      * touched), so we borrow the always-present Google bridge instance
-     * [Mirror.bridge] purely as a stateless scaler. [key] arrives here as the
+     * the standalone watchimage scaler (bridge-independent). [key] arrives here as the
      * mediaID we stashed in [mediaContentFor]; maxW/maxH/maxBytes/quality come
      * straight from the watch's REQ_IMAGE and are honored by the scaler.
      */
@@ -300,14 +301,15 @@ object BeeperImages {
     ): String {
         val png = File(dir(ctx), "$key.png")
         if (!png.exists()) return errStr("no cached image for key")
-        val bridge = Mirror.bridge ?: return errStr("scaler unavailable")
         return try {
             val b64 = Base64.encodeToString(png.readBytes(), Base64.NO_WRAP)
-            // gomobile lowercases the first letter of the exported Go method
-            // Bridge.ProcessInlineImageForWatch -> processInlineImageForWatch,
-            // and Go int params bind as Java/Kotlin Long (matches how
-            // GoogleMessagesService calls the identical method).
-            bridge.processInlineImageForWatch(
+            // Bridge-INDEPENDENT scaler: the standalone watchimage pipeline exposed as
+            // a package-level static, so image scaling works with NO Google session /
+            // null Mirror.bridge (Beeper is serverless). Same watchimage pipeline and
+            // same JSON shape {"w","h","pixels",...} as the old bridge scaler. gomobile
+            // binds Go int params as Long, and maps the Go (string,error) return so a
+            // decode error THROWS (caught below -> errStr, same graceful degrade as before).
+            fi.mirrormsg.mirrorbridge.Mirrorbridge.encodeImageForWatch(
                 b64, maxW.toLong(), maxH.toLong(), maxBytes.toLong(), quality.toLong()
             )
         } catch (e: Exception) {

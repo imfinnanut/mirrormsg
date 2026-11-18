@@ -257,6 +257,22 @@ interface MessagingService {
     fun markRead(conversationId: String, messageId: String): String =
         throw UnsupportedOperationException("$id does not support mark-read")
 
+    /**
+     * True when opening [conversationId] on the watch should wait for its catch-up
+     * fetch instead of first showing what's stored (default false). For a list
+     * that is always behind when opened (X's Following feed), showing it first
+     * means it grows under the reader, and every row the watch then names by
+     * position (to reply to, react to, open) points somewhere else.
+     */
+    fun catchUpBeforeShowing(conversationId: String): Boolean = false
+
+    /**
+     * The text the watch's detail view shows for a message it opened: by default
+     * the message's own [fullText]. A network may add to it on demand (X appends a
+     * post's top replies). Called off the main thread; may block on the network.
+     */
+    fun detailText(conversationId: String, messageId: String, fullText: String): String = fullText
+
     /** Download+scale a media image for the watch. Returns the bridge's JSON. */
     fun downloadImage(
         mediaId: String, decryptionKeyB64: String,
@@ -268,4 +284,82 @@ interface MessagingService {
         mediaDataB64: String,
         maxW: Int, maxH: Int, maxBytes: Int, quality: Int
     ): String
+
+    /**
+     * Download media ONCE and encode it as whichever it turns out to be:
+     *
+     *     {"kind":"gif","data":{...}}  or  {"kind":"image","data":{...}}
+     *
+     * Nothing can tell an animated GIF from a still without the bytes, and the
+     * bytes cost a network round-trip — so asking first and downloading second
+     * would mean fetching twice. This asks once and reports what arrived.
+     *
+     * DEFAULTS TO "" so a bridge that hasn't implemented it simply falls through
+     * to the existing still-image path. Networks light up one at a time as their
+     * bridges gain the method, instead of the caller needing to know which are
+     * ready.
+     *
+     * gifBytes bounds an ANIMATION specifically (0 = use maxBytes). startRung
+     * skips that many rungs of the encoder's degradation ladder — the watch
+     * bumps it after refusing one, so each retry is strictly smaller than the
+     * attempt it rejected.
+     */
+    fun downloadMediaForWatch(
+        mediaId: String, decryptionKeyB64: String,
+        maxW: Int, maxH: Int, maxBytes: Int, quality: Int,
+        fpsFloor: Int, maxFrames: Int, gifBytes: Int, startRung: Int
+    ): String = ""
+
+    /**
+     * Download and decrypt a message's media (a video) to [path] for the phone's
+     * own decoder (video streaming). Returns the byte count, or -1 when this
+     * network can't (the default).
+     */
+    fun downloadMediaToFile(mediaId: String, decryptionKeyB64: String, path: String): Long = -1L
+
+    /** Inline twin of [downloadMediaForWatch]; same contract, same default. */
+    fun processInlineMediaForWatch(
+        mediaDataB64: String,
+        maxW: Int, maxH: Int, maxBytes: Int, quality: Int,
+        fpsFloor: Int, maxFrames: Int, gifBytes: Int, startRung: Int
+    ): String = ""
+
+    /**
+     * True if this message's media is an ANIMATION rather than a still.
+     *
+     * Judged from the message JSON's mime type, so it is metadata-cheap and
+     * available at thread-push time — no download required. That makes it
+     * suitable for telling the watch which rows animate (so they can show a
+     * motion icon rather than a photo icon, and eventually animate their
+     * thumbnails). It is a hint, not proof: a mislabelled file will be corrected
+     * when the bytes are actually fetched and IsAnimatedGif disagrees.
+     */
+    fun messageIsAnimated(messageJson: String): Boolean {
+        return messageJson.contains("\"image/gif\"", ignoreCase = true)
+    }
+
+    // ---- Contact photos (OPT-IN) ---------------------------------------------
+
+    /**
+     * The photo a conversation shows: in the watch's chat list (the row's avatar,
+     * cut to its circle) and as the picture of its notifications. Returns an id that
+     * names the photo and changes when the photo does (an address carrying the
+     * image's own hash, say), or null for none: the DEFAULT, which keeps the coloured
+     * letter, so a network lights up only once it implements this and [avatarBytes].
+     *
+     * [row] is the conversation's JSON as [listConversations] / [listContext] gave it,
+     * when asked for a row of the chat list; null when asked for a notification (a
+     * network may answer differently: Discord's server channels keep their letters in
+     * the list but show the server's icon on notifications). With a row it must be
+     * cheap (no network); with null it's asked off the main thread and may block.
+     */
+    fun avatarId(conversationId: String, row: org.json.JSONObject?): String? = null
+
+    /**
+     * The photo [avatarId] names, as image bytes (JPEG, PNG or WebP), or null when
+     * there is none. THROW when it can't be had right now (a timeout, an error page):
+     * it's asked again later, where null is remembered for a day. Called off the main
+     * thread; may block on the network. Kept on the phone for days, so asked rarely.
+     */
+    fun avatarBytes(avatarId: String): ByteArray? = null
 }

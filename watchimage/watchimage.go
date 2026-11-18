@@ -300,13 +300,28 @@ func chooseDepth(a ColorAnalysis, maxDepth BitDepth) BitDepth {
 		depth = Depth4
 	}
 
-	// Hue refinement: if the image spans very few hue families, its "extra"
-	// colors are mostly shades of the same hue, which collapse acceptably — allow
-	// one step down (never below 1bpp). Skip when already at the floor.
-	if a.HueFamilies <= 1 && depth == Depth4 && a.SignificantColors <= 8 {
-		depth = Depth2
-	} else if a.HueFamilies <= 1 && depth == Depth2 {
-		depth = Depth1
+	// Banding risk threshold. Lowered from 0.85: a real photograph measures around
+	// 0.82 (verified on a dark interior shot), so the old threshold sat just above
+	// the exact case it existed to protect and never fired for photos.
+	const smoothBandRisk = 0.60
+
+	// Hue refinement: if the image spans very few hue families, its "extra" colors
+	// are mostly shades of one hue, which for a FLAT GRAPHIC collapse acceptably —
+	// allow one step down (never below 1bpp).
+	//
+	// Gated on low smoothness, which matters more than it looks: a dark, moody
+	// PHOTO is also "one hue family" (all blue-grey), but its content is precisely
+	// a long ramp of SHADES — the thing hue count cannot see. Without this gate a
+	// photo measuring 4 significant colors got demoted to Depth2 and then again to
+	// Depth1, i.e. rendered with TWO colors: solid black blobs against one flat
+	// tone. That was the real cause of the "harsh black/cyan banding", not palette
+	// selection or dither gating.
+	if a.Smoothness < smoothBandRisk {
+		if a.HueFamilies <= 1 && depth == Depth4 && a.SignificantColors <= 8 {
+			depth = Depth2
+		} else if a.HueFamilies <= 1 && depth == Depth2 {
+			depth = Depth1
+		}
 	}
 
 	// Banding guard: a SMOOTH image (large gradient regions) bands visibly at low
@@ -314,7 +329,6 @@ func chooseDepth(a ColorAnalysis, maxDepth BitDepth) BitDepth {
 	// isn't a truly flat 1-2 color graphic. This runs BEFORE the maxDepth clamp so
 	// the clamp always has the final say (a thumbnail capped at Depth2 stays there
 	// even if banding would otherwise push toward Depth4).
-	const smoothBandRisk = 0.85
 	if a.Smoothness >= smoothBandRisk && a.SignificantColors > 2 {
 		switch depth {
 		case Depth1:
@@ -371,34 +385,243 @@ func toGColor8(r, g, b uint32) byte {
 
 // ---- palette building -------------------------------------------------------
 
-// buildPalette picks up to size (2,4,16) palette entries: the most frequently
-// occurring GColor8 values in the image. Cheap and effective for the watch. The
-// result always has exactly size entries (unused slots repeat the last real one).
+// buildPalette picks up to size (2,4,16) palette entries by MEDIAN CUT over the
+// image's GColor8 histogram (Heckbert's algorithm): treat the used colors as a
+// box in color space, repeatedly split the box with the largest spread, and take
+// each final box's population-weighted average as a palette entry.
+//
+// This replaced a frequency sort (take the N most common colors), which failed
+// badly on the images that matter most. Dithering can only mix colors that are
+// IN the palette — it cannot invent one — so palette CONTENT decides everything.
+// On a dark photo the 16 most COMMON colors are 16 near-identical dark blue-greys:
+// no midtone exists, so every mid-grey has to be approximated by spatially mixing
+// near-black with whatever lone bright entry survived the sort. That's the "hard
+// black with cyan speckle" failure: banded shadows, no smooth ramp.
+//
+// Median cut instead spreads the same N slots ACROSS the range. Splitting by
+// spread (not by count) guarantees distant colors get their own boxes, and the
+// per-box AVERAGE lands on colors that may be nowhere near the most common —
+// which is exactly where the missing midtones come from. Both the box choice and
+// the split point are population-weighted, so a large flat region doesn't lose a
+// slot to a handful of stray pixels.
+//
+// The result always has exactly size entries (unused slots repeat the last real
+// one), matching the old contract.
 func buildPalette(g8 []byte, size int) []byte {
+	// Histogram over the 64-color GColor8 space (2 bits/channel).
 	counts := make(map[byte]int, 64)
 	for _, v := range g8 {
 		counts[v]++
 	}
-	type vc struct {
-		v byte
-		c int
+	if len(counts) == 0 {
+		pal := make([]byte, size)
+		for i := range pal {
+			pal[i] = 0xC0
+		}
+		return pal
 	}
-	arr := make([]vc, 0, len(counts))
+
+	type pcol struct {
+		r, g, b int // 0..3 per channel (GColor8 space)
+		count   int
+	}
+	initial := make([]pcol, 0, len(counts))
 	for v, c := range counts {
-		arr = append(arr, vc{v, c})
+		initial = append(initial, pcol{
+			r: int((v >> 4) & 3), g: int((v >> 2) & 3), b: int(v & 3), count: c,
+		})
 	}
-	sort.Slice(arr, func(i, j int) bool { return arr[i].c > arr[j].c })
+	// Deterministic starting order (map iteration is randomized in Go; without
+	// this the same image could encode to different palettes run to run).
+	sort.Slice(initial, func(i, j int) bool {
+		a, b := initial[i], initial[j]
+		if a.r != b.r {
+			return a.r < b.r
+		}
+		if a.g != b.g {
+			return a.g < b.g
+		}
+		return a.b < b.b
+	})
+
+	population := func(box []pcol) int {
+		n := 0
+		for _, c := range box {
+			n += c.count
+		}
+		return n
+	}
+	// extent returns the per-channel range of a box.
+	extent := func(box []pcol) (int, int, int) {
+		rl, rh, gl, gh, bl, bh := 3, 0, 3, 0, 3, 0
+		for _, c := range box {
+			if c.r < rl {
+				rl = c.r
+			}
+			if c.r > rh {
+				rh = c.r
+			}
+			if c.g < gl {
+				gl = c.g
+			}
+			if c.g > gh {
+				gh = c.g
+			}
+			if c.b < bl {
+				bl = c.b
+			}
+			if c.b > bh {
+				bh = c.b
+			}
+		}
+		return rh - rl, gh - gl, bh - bl
+	}
+	spread := func(box []pcol) int {
+		dr, dg, db := extent(box)
+		m := dr
+		if dg > m {
+			m = dg
+		}
+		if db > m {
+			m = db
+		}
+		return m
+	}
+	longestAxis := func(box []pcol) int {
+		dr, dg, db := extent(box)
+		// Tie-break toward green, then red: matches the 3:6:1 perceptual weighting
+		// used by gcolorDist/rgbDist elsewhere in this file.
+		if dg >= dr && dg >= db {
+			return 1
+		}
+		if dr >= db {
+			return 0
+		}
+		return 2
+	}
+
+	boxes := [][]pcol{initial}
+	for len(boxes) < size {
+		// Split the box with the largest spread x population. Spread alone would
+		// chase a two-pixel gradient; population alone would keep subdividing the
+		// dominant flat region. The product is the standard compromise.
+		bi, bestScore := -1, 0
+		for i, box := range boxes {
+			if len(box) < 2 {
+				continue
+			}
+			s := spread(box) * population(box)
+			if bi == -1 || s > bestScore {
+				bi, bestScore = i, s
+			}
+		}
+		if bi == -1 {
+			break // every box is a single color: nothing left to split
+		}
+		box := boxes[bi]
+		axis := longestAxis(box)
+		sort.SliceStable(box, func(i, j int) bool {
+			switch axis {
+			case 0:
+				return box[i].r < box[j].r
+			case 1:
+				return box[i].g < box[j].g
+			default:
+				return box[i].b < box[j].b
+			}
+		})
+		// Weighted median: split where half the box's PIXELS lie, keeping both
+		// halves non-empty.
+		half := population(box) / 2
+		acc, mid := 0, 1
+		for i := range box {
+			acc += box[i].count
+			if acc > half {
+				mid = i + 1
+				break
+			}
+		}
+		if mid < 1 {
+			mid = 1
+		}
+		if mid > len(box)-1 {
+			mid = len(box) - 1
+		}
+		boxes[bi] = box[:mid]
+		boxes = append(boxes, box[mid:])
+	}
+
+	// Each box contributes its population-weighted average, snapped back to
+	// GColor8. This is where midtones the frequency sort never saw come from.
+	roundDiv := func(sum, n int) int {
+		if n <= 0 {
+			return 0
+		}
+		v := (sum*2 + n) / (n * 2)
+		if v < 0 {
+			v = 0
+		}
+		if v > 3 {
+			v = 3
+		}
+		return v
+	}
+	entries := make([]byte, 0, size)
+	seen := make(map[byte]bool, size)
+	for _, box := range boxes {
+		if len(box) == 0 {
+			continue
+		}
+		sr, sg, sb, sn := 0, 0, 0, 0
+		for _, c := range box {
+			sr += c.r * c.count
+			sg += c.g * c.count
+			sb += c.b * c.count
+			sn += c.count
+		}
+		v := byte(0xC0 | roundDiv(sr, sn)<<4 | roundDiv(sg, sn)<<2 | roundDiv(sb, sn))
+		if !seen[v] {
+			seen[v] = true
+			entries = append(entries, v)
+		}
+	}
+	// Two boxes can average to the same GColor8 (the space is only 64 wide). Backfill
+	// from the most common unused colors so we never waste a slot.
+	if len(entries) < size {
+		type vc struct {
+			v byte
+			c int
+		}
+		arr := make([]vc, 0, len(counts))
+		for v, c := range counts {
+			arr = append(arr, vc{v, c})
+		}
+		sort.Slice(arr, func(i, j int) bool {
+			if arr[i].c != arr[j].c {
+				return arr[i].c > arr[j].c
+			}
+			return arr[i].v < arr[j].v // deterministic
+		})
+		for _, e := range arr {
+			if len(entries) >= size {
+				break
+			}
+			if !seen[e.v] {
+				seen[e.v] = true
+				entries = append(entries, e.v)
+			}
+		}
+	}
+
 	pal := make([]byte, size)
-	n := len(arr)
+	n := len(entries)
 	if n > size {
 		n = size
 	}
-	for i := 0; i < n; i++ {
-		pal[i] = arr[i].v
-	}
+	copy(pal[:n], entries[:n])
 	last := byte(0xC0)
 	if n > 0 {
-		last = arr[n-1].v
+		last = entries[n-1]
 	}
 	for i := n; i < size; i++ {
 		pal[i] = last
@@ -496,7 +719,9 @@ func SetConfig(thumbCoverage, fullCoverage float64, thumbCapColors, fullCapColor
 	if ditherEdge > 0 {
 		cfgDitherEdge = ditherEdge
 	}
-	if ditherStrength > 0 {
+	// >= 0 (not > 0): 0 is meaningful now — it means "dither the whole image",
+	// which is how the strength slider reaches its maximum.
+	if ditherStrength >= 0 {
 		cfgDitherStrength = ditherStrength
 	}
 	if ditherIntensity >= 0 && ditherIntensity <= 100 {
@@ -755,7 +980,10 @@ func estimateCompressed(g8 []byte, w, h int, palette []byte, depth BitDepth) int
 // this over a 5px span is a gradient worth dithering), cfgDitherIntensity (0..100
 // scale on diffused error — lower = softer, cleaner, more compressible).
 var (
-	cfgDither          = false
+	// cfgDither is ON by default: without error diffusion a 16-colour palette
+	// shows hard banding on any photographic gradient. The intensity slider
+	// remains the compression trade-off knob.
+	cfgDither          = true
 	cfgDitherEdge      = 50000 // squared weighted-RGB: concentrated step >= this = edge
 	cfgDitherStrength  = 1500  // squared weighted-RGB: span change >= this = gradient
 	cfgDitherIntensity = 100   // 0..100 error-diffusion scale
@@ -831,7 +1059,15 @@ func adaptiveDitherRGB(dst *image.RGBA, w, h int, palette []byte, edgeThresh, fl
 				step = mv
 			}
 			idx := y*w + x
-			if step >= edgeThresh {
+			// flatThresh <= 0 means "dither the WHOLE image": every pixel is a
+			// gradient pixel, no edge protection, no flat-region exclusion — the
+			// unconditional whole-image Floyd-Steinberg the sliders could never
+			// reach before (the gradient threshold used to floor at 200 and edge
+			// pixels were excluded from diffusion entirely, so flat shadow regions
+			// always got a plain snap no matter where the sliders sat).
+			if flatThresh <= 0 {
+				cls[idx] = 2
+			} else if step >= edgeThresh {
 				cls[idx] = 1
 			} else if span >= flatThresh {
 				cls[idx] = 2

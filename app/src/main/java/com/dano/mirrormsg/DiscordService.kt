@@ -29,7 +29,7 @@ import fi.mirrormsg.discordbridge.LiveSink
  * flag set on successful login — never a blocking bridge call. connectIfPossible()
  * is where the gateway actually opens, on a background thread.
  */
-class DiscordService : MessagingService {
+class DiscordService : MessagingService, ReactionRemover {
 
     override val id = "discord"
     override val displayName = "Discord"
@@ -69,7 +69,7 @@ class DiscordService : MessagingService {
      */
     override fun connectIfPossible(): Boolean {
         val ctx = Mirror.appContext ?: return false
-        val token = prefs(ctx).getString(KEY_TOKEN, "") ?: ""
+        val token = Vault.getString(prefs(ctx), KEY_TOKEN)   // sealed in the Keystore
         if (token.isEmpty()) return false
         val err = bridge().start(token)   // "" if ok / already started
         if (err.contains("dcError")) LogStore.w(TAG, "DC start: ${err.take(160)}")
@@ -209,14 +209,61 @@ class DiscordService : MessagingService {
             .put("navKind", "ENTER")
             .put("navContext", context)
 
+    // ---- Contact photos (step 90) ---------------------------------------------
+    // A DM shows the other person's avatar, a group DM its icon, a server (its row in
+    // the root list, and its channels' notifications) the server's icon: the bridge
+    // names each by its Discord CDN address, which changes with the picture. In the
+    // watch's list a server's channels keep their letters (the same icon on every row
+    // would say nothing), as do the DMs bucket and forums.
+    override fun avatarId(conversationId: String, row: org.json.JSONObject?): String? {
+        if (row != null) {
+            val nav = row.optString("navContext")
+            if (nav.startsWith("guild:")) return avatarUrl(nav)
+            if (row.optString("navKind") == "ENTER") return null
+            val channelId = conversationId.removePrefix("discord:")
+            val guildId = try { bridge().guildForChannel(channelId) } catch (_: Throwable) { "" }
+            if (guildId.isNotEmpty()) return null
+        }
+        return avatarUrl(conversationId)
+    }
+
+    private fun avatarUrl(id: String): String? =
+        (try { bridge().avatarURL(id) } catch (_: Throwable) { "" }).ifEmpty { null }
+
+    override fun avatarBytes(avatarId: String): ByteArray? = Avatars.httpGet(avatarId)
+
     override fun fetchMessages(conversationId: String, count: Long, cursor: String): String {
+        // `cursor` is the infinite-backfill anchor: empty = newest page; a message id =
+        // the page OLDER than it. Passed straight to the 3-arg bridge (Go `before=`); the
+        // returned cursor is captured into Mirror.backfillCursor so the generic backfill
+        // machinery can continue paging into history.
         val json = try {
-            bridge().fetchMessages(conversationId, count)
+            bridge().fetchMessages(conversationId, count, cursor)
         } catch (e: Throwable) {
             LogStore.w(TAG, "DC fetchMessages failed: ${e.message}")
             return "{\"messages\":[]}"
         }
+        captureCursor(conversationId, json)
         return if (json.startsWith("{")) json else "{\"messages\":[]}"
+    }
+
+    /**
+     * Capture the pagination cursor the bridge returns (the id of the OLDEST message in
+     * the batch) into the generic backfill state. A non-empty cursor arms the next older
+     * fetch; an empty/absent cursor means true top-of-channel, so backfill stops. Keyed
+     * by the VERBATIM prefixed conversationId (`discord:...`) — the same string the span
+     * handler / currentOpenConvoId uses — so the backfill lookup matches.
+     */
+    private fun captureCursor(conversationId: String, raw: String) {
+        val cur = try {
+            org.json.JSONObject(raw).optString("cursor", "")
+        } catch (_: Throwable) { "" }
+        if (cur.isNotEmpty()) {
+            Mirror.backfillCursor[conversationId] = cur
+            Mirror.backfillExhausted[conversationId] = false
+        } else {
+            Mirror.backfillExhausted[conversationId] = true
+        }
     }
 
     override fun sendMessage(conversationId: String, text: String, replyToken: String): String {
@@ -260,9 +307,7 @@ class DiscordService : MessagingService {
         targetFromMe: Boolean, emoji: String
     ): String {
         val result = try {
-            // Non-empty emoji => add. Removal needs the specific emoji, which the
-            // empty-emoji "clear" contract can't supply on Discord; the shared send
-            // path (sendTargeted) only issues adds, so this stays an add.
+            // Always an add: taking one back is removeReaction.
             bridge().sendReaction(conversationId, targetMessageId, emoji, false)
         } catch (e: Throwable) {
             LogStore.e(TAG, "DC sendReaction failed", e)
@@ -273,6 +318,23 @@ class DiscordService : MessagingService {
         // sendTargeted success check passes and the emoji isn't ALSO posted as a message.
         return if (bridgeOk(result)) "{\"messageId\":\"$targetMessageId\"}"
         else "{\"error\":\"reaction rejected\"}"
+    }
+
+    // The user's own reaction [emoji] taken back (the same one sent again from the watch,
+    // step 101). The bridge removes it as "@me"; Discord's gateway then echoes the removal
+    // under the user's id, the same key the optimistic add went in under.
+    override fun removeReaction(
+        conversationId: String, targetMessageId: String,
+        targetFromMe: Boolean, emoji: String
+    ): String {
+        val result = try {
+            bridge().sendReaction(conversationId, targetMessageId, emoji, true)
+        } catch (e: Throwable) {
+            LogStore.e(TAG, "DC removeReaction failed", e)
+            return org.json.JSONObject().put("error", e.message ?: "reaction removal failed").toString()
+        }
+        return if (bridgeOk(result)) org.json.JSONObject().put("messageId", targetMessageId).toString()
+        else org.json.JSONObject().put("error", "reaction removal rejected").toString()
     }
 
     // Mark the channel read on Discord up through messageId (ChannelMessageAck).
@@ -320,6 +382,7 @@ class DiscordService : MessagingService {
             if (replyToId.isNotEmpty()) {
                 msg.put("replyTo", org.json.JSONObject().put("id", replyToId))
             }
+            diagReplyShape("echo", msg.toString())
             LiveRouter.ingestLiveMessage("discord", msg.toString())
         } catch (e: Throwable) {
             LogStore.e(TAG, "DC optimistic echo failed", e)
@@ -346,6 +409,65 @@ class DiscordService : MessagingService {
         maxW: Int, maxH: Int, maxBytes: Int, quality: Int
     ): String = "{\"error\":\"discord has no inline images\"}"
 
+    /**
+     * The bridge holds picture links in memory only: a chat shown from the phone's
+     * store asks for its pictures before the thread fetch has refilled them (after a
+     * restart), and a held link expires after ~24h. This re-learns the links around
+     * that message from Discord (one REST call, shared by a burst of requests) so the
+     * download can be tried once more. True when its link is known now. Blocking.
+     */
+    fun recoverImage(conversationId: String, mediaId: String): Boolean = try {
+        bridge().recoverImage(conversationId, mediaId)
+    } catch (e: Throwable) {
+        LogStore.w(TAG, "DC recoverImage failed: ${e.message}")
+        false
+    }
+
+    /**
+     * A voice message's file (step 86), for the watch's voice-note player. Its media id
+     * is "<channel>/<message>": the bridge fetches the link it holds and, when that's
+     * missing (after a restart) or has expired, re-learns it from Discord and tries once
+     * more. A video never comes here: its media id is the link itself, fetched directly.
+     * Returns the byte count, or -1 (the bridge's DIAG says why). Blocking.
+     */
+    override fun downloadMediaToFile(mediaId: String, decryptionKeyB64: String, path: String): Long = try {
+        bridge().downloadMediaToFile(mediaId, path)
+    } catch (e: Throwable) {
+        LogStore.w(TAG, "DC downloadMediaToFile failed: ${e.message}")
+        -1L
+    }
+
+    // ---- Unified media (still OR animation, decided from the bytes) ---------
+    // Same CDN fetch downloadImage uses; the bridge hands the bytes to mediaroute
+    // instead of straight to the still encoder, so an animated GIF comes back as
+    // frames and anything else comes back as a picture.
+    //
+    // Returns "" on any failure — the caller reads empty as "fall back to the
+    // still path", which is the right outcome for every error here.
+
+    override fun downloadMediaForWatch(
+        mediaId: String, decryptionKeyB64: String,
+        maxW: Int, maxH: Int, maxBytes: Int, quality: Int,
+        fpsFloor: Int, maxFrames: Int, gifBytes: Int, startRung: Int
+    ): String = try {
+        bridge().downloadMediaForWatch(
+            mediaId, maxW.toLong(), maxH.toLong(), maxBytes.toLong(), quality.toLong(),
+            fpsFloor.toLong(), maxFrames.toLong(), gifBytes.toLong(), startRung.toLong()
+        )
+    } catch (e: Throwable) {
+        LogStore.w(TAG, "DC downloadMediaForWatch failed: ${e.message}")
+        ""
+    }
+
+    // Discord serves every attachment from its CDN — nothing arrives inline — so
+    // there is no inline animation path either. Empty falls through to the still
+    // handling, which reports the same thing.
+    override fun processInlineMediaForWatch(
+        mediaDataB64: String,
+        maxW: Int, maxH: Int, maxBytes: Int, quality: Int,
+        fpsFloor: Int, maxFrames: Int, gifBytes: Int, startRung: Int
+    ): String = ""
+
     companion object {
         private const val TAG = "MirrorMsgSpike"
         private const val PREFS = "mirrormsg"
@@ -353,6 +475,36 @@ class DiscordService : MessagingService {
         private const val KEY_TOKEN = "dc_token"
         private const val KEY_USERNAME = "dc_username"
         private const val KEY_SELFID = "dc_selfid"
+
+        /**
+         * TEMPORARY (DC-REPLY-DIAG) — answers who owns the "replies don't show as replies
+         * in server channels" bug. Logs, per live message the watch pipeline receives:
+         * whether a replyTo link survived, its target id, and whether this is a GUILD
+         * channel (groupName present) or a DM. `src` is "gw" (the gateway/persistent copy
+         * from buildOutMsg) or "echo" (our optimistic just-sent insert). Compare a guild
+         * reply vs a DM reply:
+         *   gw hasReply=false in GUILD but true in DM -> phone isn't emitting the link (my bug).
+         *   gw hasReply=true in GUILD -> phone is fine; watch can't resolve target (Watch Claude).
+         *   echo=true then gw=false -> gateway copy is clobbering the echo's reply header.
+         * In the companion so the live-sink (static context) can reach it; instance methods
+         * call it by simple name. Never logs message text or contacts. Remove once located.
+         */
+        private fun diagReplyShape(src: String, json: String) {
+            try {
+                val o = org.json.JSONObject(json)
+                val convo = o.optString("conversationID")
+                val hasReply = o.has("replyTo") && !o.isNull("replyTo")
+                val replyId = o.optJSONObject("replyTo")?.optString("id").orEmpty()
+                val group = o.optString("groupName", "")
+                val isMe = o.optBoolean("isMe", false) || o.optBoolean("fromMe", false)
+                val msgId = o.optString("messageID")
+                LogStore.i(
+                    TAG,
+                    "DC-REPLY-DIAG[$src] convo=$convo msgID=$msgId isMe=$isMe hasReply=$hasReply " +
+                        "replyId=$replyId kind=${if (group.isNotEmpty()) "GUILD($group)" else "DM"}"
+                )
+            } catch (_: Throwable) { /* diag only */ }
+        }
 
         private val lock = Any()
         @Volatile private var dcBridge: DcBridge? = null
@@ -375,7 +527,10 @@ class DiscordService : MessagingService {
                         b.setLiveSink(object : LiveSink {
                             override fun onEvent(eventType: String, jsonPayload: String) {
                                 when (eventType) {
-                                    "MESSAGE" -> LiveRouter.ingestLiveMessage("discord", jsonPayload)
+                                    "MESSAGE" -> {
+                                        diagReplyShape("gw", jsonPayload)
+                                        LiveRouter.ingestLiveMessage("discord", jsonPayload)
+                                    }
                                     "REACTION" -> {
                                         ReactionStore.handleBridgeEvent(jsonPayload)
                                         val open = Mirror.currentOpenConvoId
@@ -414,7 +569,8 @@ class DiscordService : MessagingService {
          * folders, which default on — so a fresh login shows DMs only until the user
          * enables specific servers in the Networks tab.
          */
-        fun serverEnabledKey(guildId: String) = "dcserver_enabled_$guildId"
+        const val SERVER_ENABLED_PREFIX = "dcserver_enabled_"
+        fun serverEnabledKey(guildId: String) = "$SERVER_ENABLED_PREFIX$guildId"
         fun serverEnabled(ctx: Context, guildId: String): Boolean =
             prefs(ctx).getBoolean(serverEnabledKey(guildId), false)
         fun setServerEnabled(ctx: Context, guildId: String, on: Boolean) {
@@ -466,12 +622,21 @@ class DiscordService : MessagingService {
          * messages from non-opted-in servers are dropped.
          */
         fun enabledGuildsCsv(ctx: Context): String {
+            // Enumerate enabled servers straight from PREFS — NOT by intersecting with
+            // the live guild list. Discord loads large guilds lazily, so a server can be
+            // enabled in prefs yet absent from listGuilds() for a while after connect or a
+            // reconnect. The old live-list filter dropped exactly those, so the bridge's
+            // channelAllowed() gate rejected their live messages (history still loaded via
+            // fetchMessages, which isn't gated) — the "enabled server never shows new
+            // messages until I re-enter" bug. Reading the prefs keys directly makes the
+            // gate independent of guild load timing.
             val ids = ArrayList<String>()
             try {
-                val arr = org.json.JSONObject(guildsJson()).optJSONArray("guilds")
-                if (arr != null) for (i in 0 until arr.length()) {
-                    val id = arr.optJSONObject(i)?.optString("id").orEmpty()
-                    if (id.isNotEmpty() && serverEnabled(ctx, id)) ids.add(id)
+                for ((k, v) in prefs(ctx).all) {
+                    if ((v as? Boolean) == true && k.startsWith(SERVER_ENABLED_PREFIX)) {
+                        val gid = k.removePrefix(SERVER_ENABLED_PREFIX)
+                        if (gid.isNotEmpty()) ids.add(gid)
+                    }
                 }
             } catch (e: Throwable) { LogStore.w(TAG, "DC enabledGuildsCsv failed: ${e.message}") }
             return ids.joinToString(",")
@@ -488,9 +653,8 @@ class DiscordService : MessagingService {
          * token, display name, and self id.
          */
         fun markLoggedIn(ctx: Context, token: String, username: String, selfId: String) {
-            prefs(ctx).edit()
-                .putBoolean(KEY_AUTHED, true)
-                .putString(KEY_TOKEN, token)
+            val ed = prefs(ctx).edit().putBoolean(KEY_AUTHED, true)
+            Vault.putString(ed, KEY_TOKEN, token)   // sealed in the Keystore
                 .putString(KEY_USERNAME, username)
                 .putString(KEY_SELFID, selfId)
                 .apply()

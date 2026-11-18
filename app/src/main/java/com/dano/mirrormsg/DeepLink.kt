@@ -35,6 +35,8 @@ data class ConvoTarget(
         const val BEEPER = "beeper"
         const val SIGNAL = "signal"
         const val MATRIX = "matrix"
+        const val X = "x"
+        const val INSTAGRAM = "instagram"
 
         fun from(protocol: String?, address: String?): ConvoTarget {
             val proto = when (protocol?.lowercase()?.trim()) {
@@ -141,6 +143,63 @@ class DiscordHandler : ProtocolHandler {
 }
 
 /**
+ * X — app-level launch. XChat conversation ids have no stable public thread
+ * link, so we open the app. Null when X isn't installed. (Native X, serviceId
+ * "xnative"; Beeper's X opens the Beeper app instead.)
+ */
+class XHandler : ProtocolHandler {
+    override val protocol = ConvoTarget.X
+    override fun canHandle(ctx: Context, target: ConvoTarget) = true
+    override fun intentFor(ctx: Context, target: ConvoTarget): Intent? =
+        launchIntentFor(ctx, "com.twitter.android")
+}
+
+/**
+ * Instagram — app-level launch: opens Instagram itself, not the chat. Null when
+ * Instagram isn't installed. (Native Instagram, serviceId "instagram"; Beeper's
+ * Instagram opens the Beeper app instead.)
+ */
+class InstagramHandler : ProtocolHandler {
+    override val protocol = ConvoTarget.INSTAGRAM
+    override fun canHandle(ctx: Context, target: ConvoTarget) = true
+    override fun intentFor(ctx: Context, target: ConvoTarget): Intent? =
+        launchIntentFor(ctx, "com.instagram.android")
+}
+
+/**
+ * Native Signal (serviceId "signalnative"). Signal opens a 1:1 chat from a
+ * signal.me/#p/+E164 link, so when we hold the contact's number — directly as
+ * the address, or resolved by the Signal bridge from the conversation id — the
+ * exact conversation opens. Groups and number-less contacts (phone-number
+ * privacy) launch the app. Null when Signal isn't installed. (Beeper's Signal
+ * opens the Beeper app instead.)
+ */
+class SignalHandler : ProtocolHandler {
+    override val protocol = ConvoTarget.SIGNAL
+    override fun canHandle(ctx: Context, target: ConvoTarget) = true
+    override fun intentFor(ctx: Context, target: ConvoTarget): Intent? {
+        val pkg = SignalService.SIGNAL_PACKAGE
+        val launch = launchIntentFor(ctx, pkg) ?: return null
+        val addr = target.address.trim()
+        val digits = addr.filter { it.isDigit() }
+        val link = when {
+            addr.startsWith("+") && digits.length >= 7 -> "https://signal.me/#p/+$digits"
+            addr.isNotEmpty() -> try {
+                (ServiceRegistry.byId(ctx, "signalnative") as? SignalService)?.deepLinkUri(addr) ?: ""
+            } catch (_: Throwable) { "" }
+            else -> ""
+        }
+        if (link.isNotEmpty()) {
+            return Intent(Intent.ACTION_VIEW, Uri.parse(link)).apply {
+                setPackage(pkg)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+        }
+        return launch
+    }
+}
+
+/**
  * Beeper — app-level launch for every Beeper-bridged network (Discord, Signal,
  * X, Instagram, …). Beeper exposes no public per-room deep link, so we open the
  * app. Null when Beeper isn't installed.
@@ -163,6 +222,9 @@ object DeepLink {
         TelegramHandler(),
         FacebookHandler(),
         DiscordHandler(),
+        XHandler(),
+        InstagramHandler(),
+        SignalHandler(),
         BeeperHandler(),
     )
 
@@ -173,6 +235,9 @@ object DeepLink {
         serviceId == "tgnative"  -> ConvoTarget.TELEGRAM
         serviceId == "facebook"  -> ConvoTarget.FACEBOOK
         serviceId == "discord"   -> ConvoTarget.DISCORD
+        serviceId == "xnative"   -> ConvoTarget.X
+        serviceId == "instagram" -> ConvoTarget.INSTAGRAM
+        serviceId == "signalnative" -> ConvoTarget.SIGNAL
         // Every Beeper-bridged network opens the Beeper app.
         serviceId != null && ServiceRegistry.byId(ctx, serviceId) is BeeperServiceBase -> ConvoTarget.BEEPER
         else -> ConvoTarget.SMS   // legacy / unknown default

@@ -34,7 +34,7 @@ import java.io.File
  *
  * Discovered by [ServiceRegistry] via its no-arg constructor.
  */
-class WhatsAppService : MessagingService {
+class WhatsAppService : MessagingService, ReactionRemover {
 
     override val id = "whatsapp"
     override val displayName = "WhatsApp"
@@ -67,7 +67,7 @@ class WhatsAppService : MessagingService {
                     ReactionStore.handleBridgeEvent(jsonPayload)
                     try {
                         val o = org.json.JSONObject(jsonPayload)
-                        LogStore.i(TAG, "WA reaction ${o.optString("op")} emoji=${o.optString("emoji")} msg=${o.optString("msg").takeLast(8)}")
+                        LogStore.i(TAG, "WA reaction ${o.optString("op")} msg=..${o.optString("msg").takeLast(8)}")
                     } catch (_: Exception) {}
                     // The reaction is now in the store, but it rides on no message, so
                     // nothing re-pushes the thread. If a WhatsApp thread is open, refresh
@@ -82,11 +82,6 @@ class WhatsAppService : MessagingService {
                 "CONNECTED" -> {
                     connected = true
                     pairingListener?.invoke(eventType, jsonPayload)
-                    // One-shot, read-only diagnostic (the bridge guards it to run
-                    // once per session): dump what whatsmeow's contact store holds
-                    // for our chats, so we can see if saved names are available
-                    // before wiring contact-name resolution. TEMPORARY.
-                    try { waBridge?.dumpContacts() } catch (_: Throwable) {}
                     // Fetch + cache group subjects so the list shows group names.
                     try { waBridge?.ensureGroupNames() } catch (_: Throwable) {}
                     // Merge any 1:1 chat that split across a contact's @lid and
@@ -133,6 +128,8 @@ class WhatsAppService : MessagingService {
         return synchronized(lock) {
             waBridge ?: run {
                 try {
+                    // The encrypted-store build kept its key here; that build is gone.
+                    try { c.deleteSharedPreferences("whatsapp_store") } catch (_: Throwable) {}
                     val storePath = File(c.filesDir, "wa.db").absolutePath
                     Whatsappbridge.newBridge(storePath, sink).also { waBridge = it }
                 } catch (e: Throwable) {
@@ -147,7 +144,10 @@ class WhatsAppService : MessagingService {
     override fun isLoggedIn(): Boolean =
         try { ensureBridge()?.isPaired() ?: false } catch (e: Throwable) { false }
 
-    override fun accountLabel(): String = ""   // resolved from the device JID later
+    override fun accountLabel(): String =
+        try {
+            ensureBridge()?.selfNumber()?.takeIf { it.isNotEmpty() }?.let { "+$it" } ?: ""
+        } catch (_: Throwable) { "" }
 
     // ---- Lifecycle ---------------------------------------------------------
 
@@ -176,9 +176,12 @@ class WhatsAppService : MessagingService {
         try { waBridge?.close() } catch (_: Throwable) {}
         waBridge = null
         connected = false
-        for (n in listOf("wa.db", "wa.db-wal", "wa.db-shm", "wa.db-journal", "wa.db.chats.json")) {
+        for (n in listOf("wa.db", "wa.db-wal", "wa.db-shm", "wa.db-journal", "wa.db.chats.json", "wa.db.avatars.json")) {
             try { File(context.filesDir, n).delete() } catch (_: Throwable) {}
         }
+        // Per-chat message history now lives in a directory; clear it too so a
+        // re-link starts from a clean, empty store.
+        try { File(context.filesDir, "wa.db.msgs").deleteRecursively() } catch (_: Throwable) {}
         LogStore.i(TAG, "WhatsApp logged out (local session cleared)")
     }
 
@@ -237,13 +240,32 @@ class WhatsAppService : MessagingService {
             "{\"conversations\":[]}"
         }
 
-    override fun fetchMessages(conversationId: String, count: Long, cursor: String): String =
-        try {
-            ensureBridge()?.fetchMessages(conversationId, count) ?: "{\"messages\":[]}"
+    override fun fetchMessages(conversationId: String, count: Long, cursor: String): String {
+        val resp = try {
+            ensureBridge()?.fetchMessages(conversationId, count, cursor) ?: "{\"messages\":[]}"
         } catch (e: Throwable) {
             LogStore.e(TAG, "WhatsApp fetchMessages failed", e)
-            "{\"messages\":[]}"
+            Mirror.backfillExhausted[conversationId] = true
+            return "{\"messages\":[]}"
         }
+        // Capture the pagination cursor so the generic backfill can page older
+        // history. A cursor with a real anchor => older messages remain; its absence
+        // => we've reached the oldest stored message (clean stop). WhatsApp history
+        // is bounded (whatever the last FULL sync delivered), so backfill walks the
+        // local store and then stops here — no runaway.
+        try {
+            val cur = org.json.JSONObject(resp).optJSONObject("cursor")
+            if (cur != null && cur.optString("beforeTs").isNotEmpty()) {
+                Mirror.backfillCursor[conversationId] = cur.toString()
+                Mirror.backfillExhausted[conversationId] = false
+            } else {
+                Mirror.backfillExhausted[conversationId] = true
+            }
+        } catch (_: Throwable) {
+            Mirror.backfillExhausted[conversationId] = true
+        }
+        return resp
+    }
 
     override fun sendMessage(conversationId: String, text: String, replyToken: String): String {
         // conversationId IS the chat JID. The send returns {"messageId":...};
@@ -330,18 +352,21 @@ class WhatsAppService : MessagingService {
             LogStore.e(TAG, "WhatsApp sendReaction failed", e)
             return "{\"error\":\"${e.message}\"}"
         }
-        // whatsmeow doesn't loop our own sends back, so our reaction never returns as
-        // a REACTION event to populate the store — the badge would never appear. Mirror
-        // it in ourselves under a stable self actor (ingest treats an empty emoji as a
-        // clear, so re-reacting replaces and an unreact removes). The reply path already
-        // re-streams the thread right after this, so the badge shows on that push.
-        try {
-            if (org.json.JSONObject(result).optString("messageId").isNotEmpty()) {
-                ReactionStore.ingest(targetMessageId, WA_SELF_ACTOR, emoji)
-            }
-        } catch (_: Throwable) {}
+        // whatsmeow doesn't loop our own sends back. The shared send path stores the
+        // user's reaction under selfActorKey() ("wa:self"), so nothing is ingested here
+        // (doing both counted a watch-sent reaction twice).
         return result
     }
+
+    // The user's reactions are stored under this key by the shared send path.
+    override fun selfActorKey(): String? = WA_SELF_ACTOR
+
+    // Sending the same emoji again takes it back: on WhatsApp an empty reaction
+    // removes the user's reaction from the message.
+    override fun removeReaction(
+        conversationId: String, targetMessageId: String,
+        targetFromMe: Boolean, emoji: String
+    ): String = sendReaction(conversationId, targetMessageId, targetFromMe, "")
 
     // Mark the thread read on WhatsApp up through messageId. whatsmeow marks by a
     // per-chat high-water mark, so the newest message clears the whole thread; the
@@ -393,6 +418,35 @@ class WhatsAppService : MessagingService {
     }
 
     override fun replyTokenFor(conversationId: String): String = ""   // JID is the convoId; no routing token
+
+    // Contact/group photos. With a row (packing the chat list) the bridge answers
+    // from its cache only and looks unknown chats up in the background; with null
+    // (a notification, off the main thread) it may ask WhatsApp now.
+    override fun avatarId(conversationId: String, row: org.json.JSONObject?): String? =
+        try {
+            ensureBridge()?.avatarID(conversationId, row == null)?.takeIf { it.isNotEmpty() }
+        } catch (e: Throwable) {
+            null
+        }
+
+    // WhatsApp's picture addresses lapse, so the bridge gets a fresh one each time.
+    // "" = no photo (null); a failure throws, so the phone tries again later.
+    override fun avatarBytes(avatarId: String): ByteArray? {
+        val b = ensureBridge() ?: throw IllegalStateException("whatsapp bridge unavailable")
+        val url = b.avatarURL(avatarId)
+        if (url.isEmpty()) return null
+        return Avatars.httpGet(url)
+    }
+
+    // Video and voice notes: the bridge fetches + decrypts the file for the phone.
+    // mediaId is the message ID; the key lives in the stored media handle.
+    override fun downloadMediaToFile(mediaId: String, decryptionKeyB64: String, path: String): Long =
+        try {
+            ensureBridge()?.downloadMediaToFile(mediaId, path) ?: -1L
+        } catch (e: Throwable) {
+            LogStore.e(TAG, "WhatsApp downloadMediaToFile failed", e)
+            -1L
+        }
 
     override fun downloadImage(
         mediaId: String, decryptionKeyB64: String,

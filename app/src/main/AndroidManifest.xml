@@ -5,6 +5,23 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- Keep-alive stack. Every network connection (Google's long-poll, Discord's
+         gateway, WhatsApp, Telegram, Facebook, the Beeper observers) lives in this
+         app's PROCESS; without a foreground service nothing gives Android a reason
+         to keep that process, so it was reclaimed after a few idle hours and
+         notifications stopped until the app was reopened.
+         TYPE = remoteMessaging (transferring messages phone -> watch): it has NO
+         6-hour runtime cap (dataSync does, on Android 15+, which would recreate
+         the bug on a timer at targetSdk 36) and it is NOT among the types Android
+         15 forbids starting from a BOOT_COMPLETED receiver. Both permissions are
+         normal/install-time — no runtime prompt.
+         NOTE: foreground service types must also be declared in the Play Console
+         App content page when submitting. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
+    <!-- Restart the anchor service after a reboot or an app update. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
     <!-- Lets MirrorMsg start an activity from the BACKGROUND, which is what
          "open on phone" from the watch needs. When the Pebble companion fires the
          notification action while it's backgrounded, Android's background-activity-
@@ -39,6 +56,8 @@
         <package android:name="org.telegram.messenger" />
         <package android:name="org.thoughtcrime.securesms" />
         <package android:name="com.discord" />
+        <package android:name="com.twitter.android" />
+        <package android:name="com.instagram.android" />
         <!-- Beeper: required under Android 11+ scoped package visibility so the
              content provider is resolvable — without this the query returns
              null with no thrown error. Provider authority declared explicitly
@@ -48,7 +67,7 @@
     </queries>
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
@@ -79,6 +98,28 @@
         <activity
             android:name=".WhatsAppPairActivity"
             android:exported="true" />
+
+        <!-- Process-lifetime anchor: holds the app alive so the network
+             connections stay up when no Activity is running. Shows a permanent
+             MIN-importance notification (the required contract for running
+             indefinitely) that sits silently at the bottom of the shade. -->
+        <service
+            android:name=".MirrorForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="remoteMessaging" />
+
+        <!-- Restarts the anchor after a reboot / app update / un-force-stop. -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true"
+            android:directBootAware="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.PACKAGE_UNSTOPPED" />
+            </intent-filter>
+        </receiver>
 
         <!-- PebbleKit Android 2: receives watch->phone requests (REQ_OPEN etc.) -->
         <service
@@ -157,6 +198,31 @@
             android:name=".DiscordLoginActivity"
             android:exported="false"
             android:label="Discord Login" />
+
+        <!-- Signal linked-device (QR) pairing. Launched from SignalService.startLogin. -->
+        <activity
+            android:name=".SignalPairActivity"
+            android:exported="false"
+            android:label="Signal Pairing" />
+
+        <!-- Native X login: x.com WebView sign-in, then the X Chat passcode.
+             Launched from XService.startLogin. configChanges keeps a fold/unfold
+             or rotation from restarting the login mid-step. -->
+        <activity
+            android:name=".XLoginActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+            android:label="X Login" />
+
+        <!-- Native Instagram login: instagram.com WebView sign-in, then the bridge
+             loads the inbox with that session. Launched from
+             InstagramService.startLogin. configChanges keeps a fold/unfold or
+             rotation from restarting the login mid-step. -->
+        <activity
+            android:name=".InstagramLoginActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+            android:label="Instagram Login" />
 
     </application>
 </manifest>

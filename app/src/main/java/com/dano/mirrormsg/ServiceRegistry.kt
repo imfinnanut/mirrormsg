@@ -43,6 +43,15 @@ object ServiceRegistry {
         // Native Discord (id "discord") + Beeper Discord (id "dcbeeper", below):
         // distinct ids, conflictGroup "discord" keeps only one active at a time.
         "com.dano.mirrormsg.DiscordService",
+        // Native Signal (id "signalnative") + Beeper Signal (id "signal", below):
+        // distinct ids, conflictGroup "signal" keeps only one active at a time.
+        "com.dano.mirrormsg.SignalService",
+        // Native X (id "xnative") + Beeper X (id "x", below): distinct ids,
+        // conflictGroup "x" keeps only one active at a time.
+        "com.dano.mirrormsg.XService",
+        // Native Instagram (id "instagram") + Beeper Instagram (id "igbeeper", below):
+        // distinct ids, conflictGroup "instagram" keeps only one active at a time.
+        "com.dano.mirrormsg.InstagramService",
         "com.dano.mirrormsg.BeeperDiscordService",
         "com.dano.mirrormsg.BeeperXService",
         "com.dano.mirrormsg.BeeperFacebookService",

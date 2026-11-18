@@ -28,7 +28,7 @@ import fi.mirrormsg.fbmessagebridge.Fbmessagebridge
  *
  * Discovered by [ServiceRegistry] via its no-arg constructor.
  */
-open class FacebookMessengerService : MessagingService {
+open class FacebookMessengerService : MessagingService, ReactionRemover {
 
     override val id = "facebook"
     override val displayName = "Facebook Messenger"
@@ -71,6 +71,13 @@ open class FacebookMessengerService : MessagingService {
     // Google's; this is Facebook's. The framework keeps them separate on purpose.
     @Volatile private var fbBridge: FbBridge? = null
 
+    // The bridge a connect was started for. A second connectIfPossible() for the
+    // same bridge (e.g. boot plus app start) used to start a second connect, which
+    // re-ran the page load during the first one's sync and then failed with
+    // "socket is already open". Cleared when a connect fails, on disconnect and on
+    // logout, so a real retry still goes through.
+    @Volatile private var connectStartedFor: FbBridge? = null
+
     // The logged-in user's fbid, captured from the READY event (and, as a fallback,
     // the first isMe message). A reaction the user sends from the watch is stored
     // optimistically under this key so a later change/removal from the Messenger app
@@ -105,7 +112,7 @@ open class FacebookMessengerService : MessagingService {
     // notification/watch path is done where the core consumes service events.
     private val sink = object : FbEventSink {
         override fun onEvent(eventType: String, jsonPayload: String) {
-            LogStore.i(logTag, "FB EVENT $eventType $jsonPayload")
+            LogStore.i(logTag, "FB EVENT $eventType ${logSafe(jsonPayload)}")
             when (eventType) {
                 "READY" -> {
                     try {
@@ -119,6 +126,7 @@ open class FacebookMessengerService : MessagingService {
                 }
                 "CONVERSATION" -> cacheConversation(jsonPayload)
                 "MESSAGE" -> cacheMessage(jsonPayload)
+                "UNSEND" -> handleUnsend(jsonPayload)
                 "REACTION" -> handleReaction(jsonPayload)
             }
         }
@@ -281,7 +289,7 @@ open class FacebookMessengerService : MessagingService {
                 if (list.none { msgKey(it) == dupKey }) {
                     list.add(msg)
                     while (list.size > MSG_CACHE_PER_THREAD) list.removeAt(0)
-                    LogStore.i(logTag, "SEED thread=$threadKey now=${list.size} text=${text.take(20)}")
+                    LogStore.i(logTag, "SEED thread=$threadKey now=${list.size} text=${text.length} chars")
                 }
             }
         } catch (e: Exception) {
@@ -316,12 +324,23 @@ open class FacebookMessengerService : MessagingService {
                 ?: convoCache[threadKey]?.optString("name")?.takeIf { it != "(no name)" }
                 ?: "")
         val sp = org.json.JSONObject().put("isMe", isMe).put("firstName", senderName)
-        val content = org.json.JSONObject().put("content", text)
+        // An unsent message keeps its place but shows Messenger's line instead of
+        // its content (the bridge sends it with no text, media or quote).
+        val unsent = e.optBoolean("unsent", false)
+        val shown = if (unsent) unsentLine(isMe, e.optString("senderName")) else text
+        val content = org.json.JSONObject().put("content", shown)
         val info = org.json.JSONObject().put("messageContent", content)
+        // An album: several pictures/videos, listed by the bridge in "media" in
+        // order, each with its own id (the message id for the first, id#i after),
+        // which the bridge's downloads look up. Each becomes a part of its own: the
+        // first in this entry, the rest in entries of their own. A lone picture or
+        // video comes as the single markers below instead.
+        val parts = if (unsent) null else e.optJSONArray("media")
+        val album = parts != null && parts.length() > 0
         // If the bridge tagged this message as carrying an image, add mediaContent
         // so the watch knows to request it. mediaID = the FB messageId; the bridge's
-        // downloadImage looks the CDN URL up by it. (Video is left as "[video]" text.)
-        val imageMime = e.optString("imageMime", "")
+        // downloadImage looks the CDN URL up by it.
+        val imageMime = if (unsent || album) "" else e.optString("imageMime", "")
         if (imageMime.isNotEmpty()) {
             val media = org.json.JSONObject()
                 .put("format", "IMAGE")
@@ -329,17 +348,75 @@ open class FacebookMessengerService : MessagingService {
                 .put("mediaID", mid)
             info.put("mediaContent", media)
         }
+        val messageInfo = org.json.JSONArray().put(info)
+        if (album && parts != null) {
+            for (i in 0 until parts.length()) {
+                val p = parts.optJSONObject(i) ?: continue
+                val id = p.optString("id", "")
+                if (id.isEmpty()) continue
+                val part = org.json.JSONObject()
+                if (p.optString("kind") == "video") {
+                    part.put("format", "VIDEO")
+                        .put("mimeType", p.optString("mime", "video/mp4"))
+                        .put("mediaID", id)
+                        .put("gifLike", p.optBoolean("gifLike", false))
+                    val poster = p.optString("posterMediaID", "")
+                    if (poster.isNotEmpty()) part.put("posterMediaID", poster)
+                } else {
+                    part.put("format", "IMAGE")
+                        .put("mimeType", p.optString("mime", "image/jpeg"))
+                        .put("mediaID", id)
+                }
+                if (info.has("mediaContent")) {
+                    messageInfo.put(org.json.JSONObject().put("mediaContent", part))
+                } else {
+                    info.put("mediaContent", part)
+                }
+            }
+        }
+        // Video: mediaID = the FB messageId; the bridge's downloadMediaToFile looks
+        // the video up by it. Poster is either inline bytes (E2EE) or a key the
+        // bridge's image download serves (cookie threads). A message that also has
+        // a photo carries the video as a second messageInfo entry.
+        val videoMime = if (unsent || album) "" else e.optString("videoMime", "")
+        if (videoMime.isNotEmpty()) {
+            val video = org.json.JSONObject()
+                .put("format", "VIDEO")
+                .put("mimeType", videoMime)
+                .put("mediaID", mid)
+                .put("gifLike", e.optBoolean("gifLike", false))
+            e.optString("posterData", "").takeIf { it.isNotEmpty() }?.let { video.put("posterData", it) }
+            e.optString("posterMediaID", "").takeIf { it.isNotEmpty() }?.let { video.put("posterMediaID", it) }
+            if (info.has("mediaContent")) {
+                messageInfo.put(org.json.JSONObject().put("mediaContent", video))
+            } else {
+                info.put("mediaContent", video)
+            }
+        }
+        // Voice message / audio file: mediaID = the FB messageId; the bridge's
+        // downloadMediaToFile serves the file, from which the phone draws the voice
+        // card. Only when there's no picture or video (they take its place).
+        val audioMime = if (unsent || album) "" else e.optString("audioMime", "")
+        if (audioMime.isNotEmpty() && !info.has("mediaContent")) {
+            info.put("mediaContent", org.json.JSONObject()
+                .put("format", "AUDIO")
+                .put("mimeType", audioMime)
+                .put("mediaID", mid))
+        }
         val out = org.json.JSONObject()
             .put("messageID", mid)
             .put("senderParticipant", sp)
             .put("timestamp", ts.toString())
-            .put("messageInfo", org.json.JSONArray().put(info))
+            .put("messageInfo", messageInfo)
+        // Pictures/videos sent as separate messages of one album share its id; the
+        // phone groups them by it.
+        e.optString("albumID", "").takeIf { it.isNotEmpty() && !unsent }?.let { out.put("albumID", it) }
         // Quoted-reply context: the bridge attaches replyTo* when this message is
         // a reply (FB hands us the quoted sender + text directly). Carry it through
         // as a "replyTo" object; the watch-packer trims and renders it.
         val replyToText = e.optString("replyToText", "")
         val replyToSender = e.optString("replyToSender", "")
-        if (replyToText.isNotEmpty() || e.optString("replyToId", "").isNotEmpty()) {
+        if (!unsent && (replyToText.isNotEmpty() || e.optString("replyToId", "").isNotEmpty())) {
             out.put("replyTo", org.json.JSONObject()
                 .put("sender", replyToSender)
                 .put("text", replyToText)
@@ -347,6 +424,80 @@ open class FacebookMessengerService : MessagingService {
                 .put("isMe", e.optBoolean("replyToIsMe", false)))
         }
         return out
+    }
+
+    // What an unsent message reads as, in Messenger's words.
+    private fun unsentLine(isMe: Boolean, name: String): String = when {
+        isMe -> "You deleted a message"
+        name.isNotEmpty() -> "$name deleted a message"
+        else -> "Message deleted"
+    }
+
+    // Put [msg] in the thread's live cache in place of any copy with the same id.
+    private fun replaceInCache(threadKey: String, msg: org.json.JSONObject) {
+        val id = msg.optString("messageID")
+        synchronized(msgCache) {
+            val list = msgCache.getOrPut(threadKey) { mutableListOf() }
+            list.removeAll { it.optString("messageID") == id }
+            list.add(msg)
+            while (list.size > MSG_CACHE_PER_THREAD) list.removeAt(0)
+        }
+    }
+
+    // Store an unsent message's replacement and refresh the watch, silently: an
+    // unsend never notifies. The store keeps a stored photo/video copy over one
+    // without media (images arrive in stages), so an unsent picture stays until
+    // the store can overwrite it outright; that's logged.
+    private fun storeUnsent(threadKey: String, msg: org.json.JSONObject, hadMedia: Boolean) {
+        val ctx = Mirror.appContext ?: return
+        replaceInCache(threadKey, msg)
+        MessageStore.merge(ctx, threadKey, org.json.JSONArray().put(msg))
+        LogStore.i(logTag, "UNSEND ${msg.optString("messageID")} in $threadKey" +
+            if (hadMedia) " (stored copy has media: kept until the store can overwrite it)" else "")
+        PebbleListenerService.onLiveMessage(threadKey)
+    }
+
+    private fun hasMedia(m: org.json.JSONObject): Boolean {
+        val infos = m.optJSONArray("messageInfo") ?: return false
+        for (i in 0 until infos.length()) {
+            if (infos.optJSONObject(i)?.optJSONObject("mediaContent")?.optString("mediaID")?.isNotEmpty() == true) return true
+        }
+        return false
+    }
+
+    // A message removed by id only (cookie LSDeleteMessage, or an E2EE revoke):
+    // the stored copy is replaced by one that keeps its sender, time and place and
+    // reads "… deleted a message". Nothing stored under that id: nothing to do.
+    private fun handleUnsend(jsonPayload: String) {
+        try {
+            val e = org.json.JSONObject(jsonPayload)
+            val threadKey = e.opt("threadKey")?.toString() ?: return
+            val id = e.optString("messageId")
+            if (id.isEmpty()) return
+            val ctx = Mirror.appContext ?: return
+            var stored: org.json.JSONObject? = null
+            val arr = MessageStore.load(ctx, threadKey)
+            for (i in 0 until arr.length()) {
+                val m = arr.optJSONObject(i) ?: continue
+                if (m.optString("messageID") == id) { stored = m; break }
+            }
+            if (stored == null) stored = synchronized(msgCache) {
+                msgCache[threadKey]?.firstOrNull { it.optString("messageID") == id }
+            }
+            val found: org.json.JSONObject = stored ?: run {
+                LogStore.i(logTag, "UNSEND $id in $threadKey: not stored, nothing to replace")
+                return
+            }
+            val sp = found.optJSONObject("senderParticipant")
+            val line = unsentLine(sp?.optBoolean("isMe", false) ?: false, sp?.optString("firstName") ?: "")
+            val tomb = org.json.JSONObject(found.toString())
+            tomb.remove("replyTo")
+            tomb.put("messageInfo", org.json.JSONArray().put(
+                org.json.JSONObject().put("messageContent", org.json.JSONObject().put("content", line))))
+            storeUnsent(threadKey, tomb, hasMedia(found))
+        } catch (ex: Exception) {
+            LogStore.e(logTag, "handleUnsend failed", ex)
+        }
     }
 
     private fun cacheMessage(jsonPayload: String) {
@@ -369,6 +520,21 @@ open class FacebookMessengerService : MessagingService {
             if (selfFbid == null && e.optBoolean("isMe", false)) {
                 val sid = e.optLong("senderId", 0L)
                 if (sid != 0L) selfFbid = sid.toString()
+            }
+            // An unsent message replaces whatever copy is held, so it skips the
+            // dedup below, and it never notifies.
+            if (e.optBoolean("unsent", false)) {
+                if (msgId.isNotEmpty()) seenMsgIds.add("$threadKey/$msgId")
+                val ctx = Mirror.appContext ?: return
+                val msg = mapFlatMessage(e)
+                var hadMedia = false
+                val arr = MessageStore.load(ctx, threadKey)
+                for (i in 0 until arr.length()) {
+                    val m = arr.optJSONObject(i) ?: continue
+                    if (m.optString("messageID") == msg.optString("messageID")) { hadMedia = hasMedia(m); break }
+                }
+                storeUnsent(threadKey, msg, hadMedia)
+                return
             }
             // Dedup: the same message can arrive on initial sync and via realtime.
             if (msgId.isNotEmpty()) {
@@ -457,7 +623,7 @@ open class FacebookMessengerService : MessagingService {
     }
 
     override fun connectIfPossible(): Boolean {
-        val saved = prefs().getString("${prefsPrefix}_session", "") ?: ""
+        val saved = Vault.getString(prefs(), "${prefsPrefix}_session")
         if (saved.isEmpty()) return false
         return try {
             val b = fbBridge ?: run {
@@ -474,6 +640,11 @@ open class FacebookMessengerService : MessagingService {
                 LogStore.i(logTag, "FB restore: bridge reports not logged in")
                 return false
             }
+            if (connectStartedFor === b) {
+                LogStore.i(logTag, "FB connect already started for this session; not starting another")
+                return true
+            }
+            connectStartedFor = b
             // connect() opens the realtime socket and BLOCKS running the read
             // loop, so it must run off this thread (same as completeCookieLogin).
             // Events arrive via the sink; errors surface there + in LogStore.
@@ -483,10 +654,11 @@ open class FacebookMessengerService : MessagingService {
                     b.connect()
                     val session = b.exportSession()
                     if (!session.isNullOrEmpty()) {
-                        prefs().edit().putString("${prefsPrefix}_session", session).apply()
+                        Vault.putString(prefs(), "${prefsPrefix}_session", session)
                         LogStore.i(logTag, "FB session re-exported after restore connect")
                     }
                 } catch (e: Throwable) {
+                    if (connectStartedFor === b) connectStartedFor = null
                     LogStore.e(logTag, "FB restore connect (bg) failed: ${e.message}", e)
                 }
             }.start()
@@ -499,12 +671,14 @@ open class FacebookMessengerService : MessagingService {
     }
 
     override fun disconnect() {
+        connectStartedFor = null
         try { fbBridge?.disconnect() } catch (_: Exception) {}
     }
 
     override fun logout(context: Context) {
         context.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE).edit()
             .remove("${prefsPrefix}_session").remove("${prefsPrefix}_label").apply()
+        connectStartedFor = null
         try { fbBridge?.disconnect() } catch (_: Exception) {}
         fbBridge = null
     }
@@ -535,21 +709,23 @@ open class FacebookMessengerService : MessagingService {
             // restart can re-load them. (exportSession/DumpState is empty until the
             // client has connected + synced, so we do NOT gate login on it here —
             // that was the "empty session after setCookies" false failure.)
-            prefs().edit().putString("${prefsPrefix}_session", cookiesJson).apply()
+            Vault.putString(prefs(), "${prefsPrefix}_session", cookiesJson)
             // connect() opens the realtime socket and can block, so run it off the
             // caller's (UI) thread. After it connects, export the REAL session
             // state and upgrade the saved seed to it. Errors surface via the sink
             // (SOCKET_ERROR / LOGGED_OUT) and LogStore.
+            connectStartedFor = b
             Thread {
                 try {
                     armE2EE(b)
                     b.connect()
                     val session = b.exportSession()
                     if (!session.isNullOrEmpty()) {
-                        prefs().edit().putString("${prefsPrefix}_session", session).apply()
+                        Vault.putString(prefs(), "${prefsPrefix}_session", session)
                         LogStore.i(logTag, "FB session exported + saved after connect")
                     }
                 } catch (e: Throwable) {
+                    if (connectStartedFor === b) connectStartedFor = null
                     LogStore.e(logTag, "FB connect (post-login) failed", e)
                 }
             }.start()
@@ -591,17 +767,59 @@ open class FacebookMessengerService : MessagingService {
                 LogStore.w(logTag, "FETCH: fbBridge is NULL for $conversationId (cache=${merged.size})")
             }
             val raw = fbBridge?.fetchMessages(conversationId, count, cursor)
+            // CURSOR-DIAG (temporary): log the raw response's TOP-LEVEL SHAPE — key
+            // names, and the value of any key that ISN'T the bulk "messages" array — so
+            // we can read FB's pagination cursor field (if any) off a live fetch, the
+            // same way we did for Google. Remove once FB backfill is wired.
+            if (!raw.isNullOrEmpty()) try {
+                val o = org.json.JSONObject(raw)
+                val sb = StringBuilder("FB-CURSOR-DIAG keys=[")
+                val it = o.keys()
+                while (it.hasNext()) {
+                    val k = it.next()
+                    sb.append(k)
+                    if (k != "messages") {
+                        val vs = o.get(k).toString()
+                        sb.append("=").append(if (vs.length > 160) vs.take(160) + "…" else vs)
+                    }
+                    if (it.hasNext()) sb.append(", ")
+                }
+                sb.append("]")
+                LogStore.i(logTag, sb.toString())
+            } catch (_: Exception) { /* diag only */ }
             LogStore.i(logTag,
                 "FETCH convo=$conversationId bridge=${if (fbBridge==null) "null" else "ok"} " +
-                "rawLen=${raw?.length ?: -1} cache=${merged.size} raw=${raw?.take(200)}")
+                "rawLen=${raw?.length ?: -1} cache=${merged.size}")
             if (!raw.isNullOrEmpty()) {
-                val arr = org.json.JSONObject(raw).optJSONArray("messages") ?: org.json.JSONArray()
+                val obj = org.json.JSONObject(raw)
+                // Capture the bridge's backfill cursor + exhaustion so the generic
+                // backfill in PebbleListenerService can page older history (it keys
+                // off Mirror.backfillCursor) and stop cleanly at the true top of the
+                // thread. FB's cursor shape is {referenceMessageId, referenceTimestampMs};
+                // the bridge takes it back verbatim as the next-page anchor. Same seam
+                // Google uses — only the cursor's internal fields differ.
+                val cur = obj.optJSONObject("cursor")
+                if (cur != null && cur.optString("referenceMessageId").isNotEmpty()) {
+                    Mirror.backfillCursor[conversationId] = cur.toString()
+                    Mirror.backfillExhausted[conversationId] = false
+                } else {
+                    // No cursor -> either the top of the thread, or a thread we can't
+                    // page (E2EE / no anchor). Honor the bridge's explicit exhausted flag.
+                    Mirror.backfillExhausted[conversationId] = obj.optBoolean("exhausted", false)
+                }
+                val arr = obj.optJSONArray("messages") ?: org.json.JSONArray()
                 for (i in 0 until arr.length()) {
                     val flat = arr.getJSONObject(i)
                     // Cache+dedup so future opens are instant and live events don't double up.
                     val mid = flat.opt("messageId")?.toString() ?: ""
                     if (mid.isNotEmpty()) seenMsgIds.add("$conversationId/$mid")
                     val mapped = mapFlatMessage(flat)
+                    // An unsent copy replaces the original, which has the same id
+                    // but a different text key.
+                    if (flat.optBoolean("unsent", false)) {
+                        val uid = mapped.optString("messageID")
+                        merged.values.removeAll { it.optString("messageID") == uid }
+                    }
                     merged[msgKey(mapped)] = mapped
                 }
             }
@@ -665,7 +883,7 @@ open class FacebookMessengerService : MessagingService {
     }
 
     // ---- Targeted send (opt-in): FB supports both on E2EE threads -----------
-    // These work on encrypted (Messenger-over-WhatsApp) threads — e.g. the wife's
+    // These work on encrypted (Messenger-over-WhatsApp) threads — e.g. a 1:1
     // chat. On cookie threads the bridge returns a phase-2 error and the caller
     // falls back to a normal send (which also can't write cookie threads yet, so
     // no regression).
@@ -706,6 +924,15 @@ open class FacebookMessengerService : MessagingService {
         }
     }
 
+    // The same emoji sent again from the watch takes it back. Messenger removes
+    // the user's reaction with an empty one, on both paths (cookie task and
+    // encrypted), as upstream does; the emoji itself isn't needed. The removal
+    // echoes back as a REACTION delete, which finds nothing left to drop.
+    override fun removeReaction(
+        conversationId: String, targetMessageId: String,
+        targetFromMe: Boolean, emoji: String
+    ): String = sendReaction(conversationId, targetMessageId, targetFromMe, "")
+
     // Mark the whole thread read on Facebook. Messenger marks read by a watermark
     // timestamp, not a message id, so the bridge ignores messageId and uses the
     // thread's newest activity — the caller's "mark up through this" intent maps to
@@ -743,7 +970,103 @@ open class FacebookMessengerService : MessagingService {
         maxW: Int, maxH: Int, maxBytes: Int, quality: Int
     ): String = errStr("fb has no inline images")
 
+    // ---- Unified media (still OR animation, decided from the bytes) ---------
+    // Same two fetch paths downloadImage uses (E2EE decrypt, or signed CDN URL);
+    // the bridge hands the bytes to mediaroute instead of straight to the still
+    // encoder, so an animated GIF comes back as frames. Nothing had to be
+    // unblocked upstream — FB already treats AttachmentTypeAnimatedImage as an
+    // image, so those bytes were always arriving, just being encoded flat.
+    //
+    // Returns "" on any failure: the caller reads empty as "fall back to the
+    // still path", which is the right outcome for every problem here.
+    override fun downloadMediaForWatch(
+        mediaId: String, decryptionKeyB64: String,
+        maxW: Int, maxH: Int, maxBytes: Int, quality: Int,
+        fpsFloor: Int, maxFrames: Int, gifBytes: Int, startRung: Int
+    ): String =
+        try {
+            fbBridge?.downloadMediaForWatch(
+                mediaId, maxW.toLong(), maxH.toLong(), maxBytes.toLong(), quality.toLong(),
+                fpsFloor.toLong(), maxFrames.toLong(), gifBytes.toLong(), startRung.toLong()
+            ) ?: ""
+        } catch (e: Throwable) {
+            LogStore.w(logTag, "fb downloadMediaForWatch failed: ${e.message}")
+            ""
+        }
+
+    // mediaId is the FB messageId; the bridge finds the video or voice message
+    // (E2EE transport or cookie playable URL) by it and writes the whole playable
+    // file to path.
+    override fun downloadMediaToFile(mediaId: String, decryptionKeyB64: String, path: String): Long =
+        try {
+            fbBridge?.downloadMediaToFile(mediaId, path) ?: -1L
+        } catch (e: Throwable) {
+            LogStore.e(logTag, "fb downloadMediaToFile failed", e)
+            -1L
+        }
+
+    // No inline media on FB, so no inline animation path either.
+    override fun processInlineMediaForWatch(
+        mediaDataB64: String,
+        maxW: Int, maxH: Int, maxBytes: Int, quality: Int,
+        fpsFloor: Int, maxFrames: Int, gifBytes: Int, startRung: Int
+    ): String = ""
+
+    // ---- Chat photos --------------------------------------------------------
+    // A 1:1 chat (encrypted ones too) shows the other person's profile picture;
+    // a group, its own picture if it was given one (else its letter stays). The
+    // bridge harvests the addresses from every sync. The id is
+    // "fb|<threadKey>|<the picture's file name>", so it changes when the picture
+    // does; the address itself is signed and lapses, so the bridge keeps the
+    // current one and avatarBytes fetches through it. The list (row) and
+    // notification (null) cases both just read what the bridge already holds:
+    // no network here.
+    override fun avatarId(conversationId: String, row: org.json.JSONObject?): String? {
+        val key = try {
+            fbBridge?.avatarKey(conversationId)
+        } catch (_: Throwable) {
+            null
+        }
+        return if (key.isNullOrEmpty()) null else "fb|$key"
+    }
+
+    // Null only when there's no picture to have (gone, unusable, or the person
+    // has none); anything that may work later throws (not connected, timeout,
+    // an error page, an address that lapsed), so the phone tries again in 2
+    // minutes instead of showing the letter for a day. The bridge's errors never
+    // carry the address.
+    override fun avatarBytes(avatarId: String): ByteArray? {
+        if (!avatarId.startsWith("fb|")) return null
+        val threadKey = avatarId.removePrefix("fb|").substringBefore('|')
+        val b = fbBridge ?: throw IllegalStateException("Messenger isn't connected")
+        return b.downloadAvatar(threadKey)?.takeIf { it.isNotEmpty() }
+    }
+
+    // ---- Facebook link pages ------------------------------------------------
+    // A facebook.com / fb.watch page read as the logged-in session, for the
+    // phone's link previews: {"status","url","body"} or {"error"} from the
+    // bridge (which paces reads and refuses other hosts). Empty when the account
+    // isn't logged in or the bridge isn't up. Blocking: call off the main thread.
+    fun fetchPage(url: String, maxBytes: Long): String {
+        if (!isLoggedIn()) return ""
+        val b = fbBridge ?: return ""
+        return try {
+            b.fetchPage(url, maxBytes) ?: ""
+        } catch (e: Throwable) {
+            errJson(e)
+        }
+    }
+
     // ---- helpers -----------------------------------------------------------
+
+    // An event payload as logged: LogStore scrubs names, text and addresses by
+    // key; this also drops what its keys don't cover: an encrypted video's
+    // poster picture (base64) and the account's own id.
+    private val posterRe = Regex("\"posterData\":\"[^\"]*\"")
+    private val fbidRe = Regex("\"fbid\":\\d+")
+    private fun logSafe(payload: String): String = payload
+        .replace(posterRe) { "\"posterData\":\"[${it.value.length - 15} chars]\"" }
+        .replace(fbidRe, "\"fbid\":\"[id]\"")
 
     private fun empty(key: String) = "{\"$key\":[]}"
     private fun errStr(msg: String) = "{\"error\":\"$msg\"}"

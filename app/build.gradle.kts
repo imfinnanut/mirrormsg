@@ -17,8 +17,19 @@ val keystoreProps = Properties().apply {
     }
 }
 
+// Extra sources: the folder named by mirrormsg.media in local.properties, else src/base.
+val localProps = Properties().apply {
+    rootProject.file("local.properties").takeIf { it.exists() }?.let { f -> FileInputStream(f).use { load(it) } }
+}
+val extraSources = localProps.getProperty("mirrormsg.media")?.let { file(it) }?.takeIf { it.isDirectory }
+
 android {
     namespace = "com.dano.mirrormsg"
+    sourceSets {
+        getByName("main") {
+            java.srcDir(extraSources ?: file("src/base/java"))
+        }
+    }
     compileSdk {
         version = release(36) {
             minorApiLevel = 1
@@ -28,8 +39,17 @@ android {
         applicationId = "com.dano.mirrormsg"
         minSdk = 26
         targetSdk = 36
-        versionCode = 8
-        versionName = "1.0.7"
+        // versionCode MUST increase on every Play upload and can never be reused
+        // or lowered — it is Play's only ordering signal. Continues the internal
+        // sideload sequence (15) rather than restarting, so no previously-installed
+        // build outranks a Play build.
+        versionCode = 24
+        // The public-facing string. Play users have never seen a MirrorMsg build,
+        // so the first listing is 1.0 (matching the release notes) even though
+        // internal sideloads had run to 1.1.2. If you'd rather keep continuity with
+        // those internal numbers, make this "1.2.0" — versionName has no ordering
+        // rules of its own; only versionCode matters to Play.
+        versionName = "1.2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // arm64 only — Go bridge is the only native code now that GeckoView is gone.
         ndk {
@@ -92,3 +112,4 @@ dependencies {
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
 }
+

@@ -20,7 +20,7 @@ import org.json.JSONObject
  *
  * Discovered by [ServiceRegistry] via its no-arg constructor.
  */
-class GoogleMessagesService : MessagingService {
+class GoogleMessagesService : MessagingService, ReactionRemover {
 
     override val id = "google"
     override val displayName = "Google Messages"
@@ -90,11 +90,109 @@ class GoogleMessagesService : MessagingService {
 
     // ---- Universal data surface --------------------------------------------
 
-    override fun listConversations(count: Int): String =
-        Mirror.bridge?.listConversations(count.toLong()) ?: "{\"conversations\":[]}"
+    override fun listConversations(count: Int): String {
+        val json = Mirror.bridge?.listConversations(count.toLong()) ?: "{\"conversations\":[]}"
+        learnAvatars(json)
+        return json
+    }
 
-    override fun fetchMessages(conversationId: String, count: Long, cursor: String): String =
-        Mirror.bridge?.fetchMessages(conversationId, count, cursor) ?: "{\"messages\":[]}"
+    // ---- Contact photos (steps 90, 91c) ---------------------------------------
+    // A 1:1 chat's photo is the other person's (the participant's thumbnail, which the
+    // Google Messages app on the phone serves from your contacts, as it does for the web
+    // page); a group's is its icon (groupAvatarURL). Ids: "p:<participantID>" /
+    // "g:<address>". Learnt from every list the bridge gives, for the notifications.
+    // Which chats and people, as mautrix-gmessages decides (chatinfo.go): a group is
+    // isGroupChat; the other person of a 1:1 is the one participant that isn't you, is
+    // visible (a participant with isVisible false is a stand-in Google adds, with no
+    // photo) and has a number. Asked whether or not the list marks them a saved contact
+    // (it rarely does); a chat without a photo is answered "none", kept a day.
+    private val avatarIds = java.util.concurrent.ConcurrentHashMap<String, String>()
+    @Volatile private var lastAvSummary = ""
+
+    override fun avatarId(conversationId: String, row: JSONObject?): String? {
+        if (row != null) return avatarIdOf(row).also { avatarIds[conversationId] = it ?: "" }
+        if (!avatarIds.containsKey(conversationId)) {
+            listConversations(100)                         // off the main thread
+            avatarIds.putIfAbsent(conversationId, "")      // not in the inbox: asked once
+        }
+        return avatarIds[conversationId]?.ifEmpty { null }
+    }
+
+    private fun learnAvatars(json: String) {
+        try {
+            val arr = JSONObject(json).optJSONArray("conversations") ?: return
+            var oneToOne = 0; var groups = 0; var icons = 0; var none = 0
+            for (i in 0 until arr.length()) {
+                val c = arr.optJSONObject(i) ?: continue
+                val id = c.optString("conversationID")
+                val av = avatarIdOf(c)
+                if (id.isNotEmpty()) avatarIds[id] = av ?: ""
+                when {
+                    c.optBoolean("isGroupChat", false) -> { groups++; if (av != null) icons++ }
+                    av == null -> none++
+                    else -> oneToOne++
+                }
+            }
+            // What the list gave, once per change (counts only: no names or numbers).
+            val sum = "${arr.length()} chats: $oneToOne 1:1 asked, $groups groups " +
+                "($icons with an icon), $none 1:1 with no one to ask"
+            if (sum != lastAvSummary) {
+                lastAvSummary = sum
+                LogStore.i("GoogleMessagesService", "Contact photos: $sum")
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun avatarIdOf(c: JSONObject): String? {
+        if (c.optBoolean("isGroupChat", false))
+            return c.optString("groupAvatarURL").takeIf { it.isNotEmpty() }?.let { "g:$it" }
+        val parts = c.optJSONArray("participants") ?: return null
+        val numbers = HashSet<String>()
+        var pid = ""
+        for (i in 0 until parts.length()) {
+            val p = parts.optJSONObject(i) ?: continue
+            if (p.optBoolean("isMe", false) || !p.optBoolean("isVisible", false)) continue
+            val id = p.optJSONObject("ID") ?: continue
+            val num = id.optString("number")
+            if (num.isEmpty()) continue
+            numbers.add(num.filter { it.isDigit() || it == '+' }.ifEmpty { num })
+            if (pid.isEmpty()) pid = id.optString("participantID")
+        }
+        return if (numbers.size == 1 && pid.isNotEmpty()) "p:$pid" else null
+    }
+
+    // The bridge's errors go up (a timeout: asked again later); no photo comes back null.
+    override fun avatarBytes(avatarId: String): ByteArray? {
+        val b = Mirror.bridge ?: throw IllegalStateException("no bridge")
+        return when {
+            avatarId.startsWith("p:") -> b.participantThumbnail(avatarId.substring(2))
+            avatarId.startsWith("g:") -> b.groupAvatar(avatarId.substring(2))
+            else -> null
+        }?.takeIf { it.isNotEmpty() }
+    }
+
+    override fun fetchMessages(conversationId: String, count: Long, cursor: String): String {
+        val resp = Mirror.bridge?.fetchMessages(conversationId, count, cursor) ?: "{\"messages\":[]}"
+        // Capture the pagination cursor for backfill (3b). The response carries a
+        // top-level "cursor" object ({lastItemID,lastItemTimestamp}) anchoring the
+        // OLDEST message in this batch; pass it back to fetch the next-older batch.
+        // Store it keyed by convo; an absent/empty cursor means we've reached the
+        // true start of the thread -> mark exhausted so backfill stops.
+        try {
+            val o = org.json.JSONObject(resp)
+            val cur = o.optJSONObject("cursor")
+            // Key by the EXACT conversationId string this method received — the same
+            // string openThread/the span handler pass (currentOpenConvoId), so the
+            // backfill lookup matches guaranteed, whatever the id format.
+            if (cur != null && cur.optString("lastItemID").isNotEmpty()) {
+                Mirror.backfillCursor[conversationId] = cur.toString()
+                Mirror.backfillExhausted[conversationId] = false
+            } else {
+                Mirror.backfillExhausted[conversationId] = true   // no cursor = true top
+            }
+        } catch (_: Exception) { /* non-fatal: backfill just won't advance */ }
+        return resp
+    }
 
     override fun sendMessage(conversationId: String, text: String, replyToken: String): String {
         val route = decodeRoute(replyToken)
@@ -137,6 +235,21 @@ class GoogleMessagesService : MessagingService {
         } catch (e: Throwable) {
             LogStore.e("GoogleMessagesService", "sendReaction failed", e)
             JSONObject().put("error", e.message ?: "reaction send failed").toString()
+        }
+    }
+
+    // The user's own reaction [emoji] taken back (the same emoji sent again, step 101):
+    // libgm's REMOVE names the reaction.
+    override fun removeReaction(
+        conversationId: String, targetMessageId: String,
+        targetFromMe: Boolean, emoji: String
+    ): String {
+        return try {
+            Mirror.bridge?.sendReaction(targetMessageId, emoji, true)
+                ?: "{\"error\":\"no bridge\"}"
+        } catch (e: Throwable) {
+            LogStore.e("GoogleMessagesService", "removeReaction failed", e)
+            JSONObject().put("error", e.message ?: "reaction removal failed").toString()
         }
     }
 
@@ -206,4 +319,48 @@ class GoogleMessagesService : MessagingService {
             mediaDataB64,
             maxW.toLong(), maxH.toLong(), maxBytes.toLong(), quality.toLong()
         ) ?: "{\"error\":\"no bridge\"}"
+
+    // ---- Unified media (still OR animation, decided from the bytes) ---------
+    // One download, one answer. See MessagingService.downloadMediaForWatch for
+    // why this can't be split into "ask, then fetch".
+
+    override fun downloadMediaForWatch(
+        mediaId: String, decryptionKeyB64: String,
+        maxW: Int, maxH: Int, maxBytes: Int, quality: Int,
+        fpsFloor: Int, maxFrames: Int, gifBytes: Int, startRung: Int
+    ): String =
+        try {
+            Mirror.bridge?.downloadMediaForWatch(
+                mediaId, decryptionKeyB64,
+                maxW.toLong(), maxH.toLong(), maxBytes.toLong(), quality.toLong(),
+                fpsFloor.toLong(), maxFrames.toLong(), gifBytes.toLong(), startRung.toLong()
+            ) ?: ""
+        } catch (e: Throwable) {
+            LogStore.w("GoogleMessagesService", "downloadMediaForWatch failed: ${e.message}")
+            ""   // empty = caller falls back to the still path
+        }
+
+    override fun downloadMediaToFile(mediaId: String, decryptionKeyB64: String, path: String): Long =
+        try {
+            Mirror.bridge?.downloadMediaToFile(mediaId, decryptionKeyB64, path) ?: -1L
+        } catch (e: Throwable) {
+            LogStore.w("GoogleMessagesService", "downloadMediaToFile failed: ${e.message}")
+            -1L
+        }
+
+    override fun processInlineMediaForWatch(
+        mediaDataB64: String,
+        maxW: Int, maxH: Int, maxBytes: Int, quality: Int,
+        fpsFloor: Int, maxFrames: Int, gifBytes: Int, startRung: Int
+    ): String =
+        try {
+            Mirror.bridge?.processInlineMediaForWatch(
+                mediaDataB64,
+                maxW.toLong(), maxH.toLong(), maxBytes.toLong(), quality.toLong(),
+                fpsFloor.toLong(), maxFrames.toLong(), gifBytes.toLong(), startRung.toLong()
+            ) ?: ""
+        } catch (e: Throwable) {
+            LogStore.w("GoogleMessagesService", "processInlineMediaForWatch failed: ${e.message}")
+            ""
+        }
 }

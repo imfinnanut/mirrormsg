@@ -35,7 +35,7 @@ class MarkReadReceiver : BroadcastReceiver() {
         // The user asked to be done with this notification — clear it now. The
         // source-side read receipt runs off-thread below (and shouldn't hold up
         // dismissing the wrist/phone banner).
-        Notifier.cancel(appCtx)
+        Notifier.cancel(appCtx, convoId)
 
         val pending = goAsync()
         CoroutineScope(Dispatchers.IO).launch {

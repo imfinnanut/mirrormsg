@@ -4,10 +4,17 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.Person
 import android.app.RemoteInput
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ShortcutInfo
+import android.content.pm.ShortcutManager
+import android.graphics.drawable.Icon
 import android.os.Build
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /**
  * Posts a normal-importance system notification so the Pebble mirrors it to
@@ -20,9 +27,30 @@ import android.os.Build
  * still handles taps on the phone itself.
  */
 object Notifier {
-    private const val CHANNEL_ID = "mirrormsg_messages_v5"
+    // Two channels exist, but routing no longer switches between them: once
+    // LiveRouter has decided a message is a Pebble notification (vs an IAN), it
+    // must ALERT — regardless of whether the watchapp happens to be open. The old
+    // watchAppOpen -> silent switch assumed "app open = the app delivers richly
+    // on-watch", which is only true on the IAN path; in Notification mode it made
+    // messages vanish entirely (Rebble drops IMPORTANCE_LOW with no history — a
+    // hardware-verified finding, do not re-litigate). The silent channel is kept
+    // registered (channel importance is immutable after creation, so the id
+    // survives) for a possible future silent phone-shade record on IAN paths.
+    private const val CHANNEL_ID = "mirrormsg_messages_v5"          // alerting — the one in use
+    private const val CHANNEL_ID_SILENT = "mirrormsg_messages_v5_silent"  // registered, unused
     private const val CHANNEL_NAME = "Messages"
-    private const val NOTIF_ID = 4201   // single reused id; latest message replaces
+    private const val CHANNEL_NAME_SILENT = "Messages (in-app, silent)"
+    // Per-conversation notification id: each chat gets its own shade entry that
+    // updates in place, and different chats STACK separately (matching Beeper's
+    // native per-chat notifications). Previously a single reused id (4201) meant every
+    // new message replaced the last, so a missed message was gone from the shade. Keyed
+    // on convoId.hashCode() — same key the reply/tap/watch PendingIntents already use,
+    // so a conversation's notification and its actions line up. Offset by a constant to
+    // avoid colliding with those PendingIntent request codes (which reuse the same hash
+    // +0..+4); notification ids and PendingIntent request codes are separate namespaces,
+    // but keeping them distinct avoids confusion.
+    private const val NOTIF_ID_BASE = 0x4201
+    private fun notifIdFor(convoId: String): Int = NOTIF_ID_BASE xor convoId.hashCode()
 
     const val EXTRA_CONVO_ID = "com.dano.mirrormsg.CONVO_ID"
     const val EXTRA_SERVICE_ID = "com.dano.mirrormsg.SERVICE_ID"
@@ -42,6 +70,13 @@ object Notifier {
                 val ch = NotificationChannel(CHANNEL_ID, CHANNEL_NAME,
                     NotificationManager.IMPORTANCE_DEFAULT).apply {
                     description = "New message alerts (mirrored to Pebble)"
+                }
+                mgr.createNotificationChannel(ch)
+            }
+            if (mgr.getNotificationChannel(CHANNEL_ID_SILENT) == null) {
+                val ch = NotificationChannel(CHANNEL_ID_SILENT, CHANNEL_NAME_SILENT,
+                    NotificationManager.IMPORTANCE_LOW).apply {
+                    description = "Silent record posted while the watchapp is open (no buzz, phone shade only)"
                 }
                 mgr.createNotificationChannel(ch)
             }
@@ -100,6 +135,7 @@ object Notifier {
                     Intent.FLAG_ACTIVITY_CLEAR_TOP or
                     Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra(EXTRA_CONVO_ID, convoId)
+            putExtra(EXTRA_SERVICE_ID, ownerServiceId)   // the thread opens on its own account
             putExtra(EXTRA_FROM_NOTIF, true)
         }
         return PendingIntent.getActivity(
@@ -149,9 +185,19 @@ object Notifier {
             creatorBalOptions())
     }
 
+    /** The text worth showing ALONGSIDE a picture: the caption if there is one,
+     *  nothing if the body is just the "[Image]" placeholder we synthesize for
+     *  image messages. */
+    private fun pictureCaption(body: String): String {
+        val stripped = body.removePrefix("[Image]").trimStart('\n', ' ')
+        return stripped
+    }
+
     fun postNewMessage(ctx: Context, convoId: String, sender: String, body: String,
-                       ownerServiceId: String, messageId: String = "", groupName: String = "") {
+                       ownerServiceId: String, messageId: String = "", groupName: String = "",
+                       picture: android.graphics.Bitmap? = null) {
         ensureChannel(ctx)
+        val whenMs = System.currentTimeMillis()
 
         val contentPi = activityIntent(ctx, convoId, ownerServiceId)   // phone banner / "open on phone"
         val watchPi   = watchIntent(ctx, convoId, ownerServiceId)  // "Open on watch" action
@@ -232,15 +278,49 @@ object Notifier {
         // notification shows drawable glyphs (no-op when the setting is off).
         val titleOut = EmojiSub.processText(title)
         val bodyOut  = EmojiSub.processText(body)
+        // Only caption a picture when there's something to say: a bare "[Image]"
+        // over the image itself is noise (bodyOut is "[Image]\n<caption>" when
+        // captioned). The picture IS the message; a caption is real content.
+        val textOut = if (picture != null) pictureCaption(bodyOut) else bodyOut
+        // ALWAYS the alerting channel. Reaching this function means the routing
+        // chose the Pebble-notification behavior — "new message = pebble system
+        // notification, nothing can change it" — so it alerts even when the
+        // watchapp is open (the notification pops over the app; the app itself
+        // stays passive and just repaints an open chat silently).
         val builder = Notification.Builder(ctx, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_dialog_email)
+            .setSmallIcon(smallIcon(ctx))
+            .setWhen(whenMs)
             .setContentTitle(titleOut)
-            .setContentText(bodyOut)
-            .setStyle(Notification.BigTextStyle().bigText(bodyOut))
+            .setContentText(textOut)
             .setContentIntent(contentPi)
             .setAutoCancel(true)
             .setOnlyAlertOnce(true)
-            .addAction(replyAction)
+        // Android 11+: a conversation (step 90), so the phone shows the chat's photo
+        // (or its letter) as the notification's picture with MirrorMsg's badge, as
+        // Discord's and Google Messages' do. Older Androids keep the plain styles.
+        val convo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
+            conversation(ctx, convoId, sender, body, ownerServiceId, ownerSvc, groupName, picture,
+                         whenMs, titleOut) else null
+        if (convo != null) {
+            builder.setStyle(convo.style).setShortcutId(convo.shortcutId)
+        } else {
+            // A picture attached here lands in the notification's EXTRA_PICTURE, which
+            // is where PebbleOS reads images from — without it MirrorMsg's
+            // notifications would show "[Image]" where a Pebble-native notification
+            // shows the actual photo. setLargeIcon puts it in the collapsed form too,
+            // and bigLargeIcon(null) stops it being duplicated when expanded.
+            if (picture != null) builder.setLargeIcon(picture)
+            builder.setStyle(
+                if (picture != null)
+                    Notification.BigPictureStyle()
+                        .bigPicture(picture)
+                        .bigLargeIcon(null as android.graphics.Bitmap?)
+                        .setSummaryText(textOut)
+                else
+                    Notification.BigTextStyle().bigText(bodyOut)
+            )
+        }
+        builder.addAction(replyAction)
         if (markReadAction != null) builder.addAction(markReadAction)
         builder.addAction(watchAction)
         if (phoneAction != null) builder.addAction(phoneAction)
@@ -255,15 +335,133 @@ object Notifier {
         if (phoneAction != null) wearableExtender.addAction(phoneAction)
         builder.extend(wearableExtender)
 
+        val n = builder.build()
+        if (convo != null) {
+            // The Pebble app reads the title, the text, the big text and the picture
+            // straight from these extras, which the conversation style rewrites (to
+            // "Chat: Sender" and the newest message): put back exactly what the plain
+            // styles gave it, so the watch's notification doesn't change.
+            n.extras.putCharSequence(Notification.EXTRA_TITLE, titleOut)
+            n.extras.putCharSequence(Notification.EXTRA_TEXT, textOut)
+            if (picture != null) n.extras.putParcelable(Notification.EXTRA_PICTURE, picture)
+            else n.extras.putCharSequence(Notification.EXTRA_BIG_TEXT, bodyOut)
+        }
         val mgr = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        mgr.notify(NOTIF_ID, builder.build())
+        mgr.notify(notifIdFor(convoId), n)
+
+        // No photo on the phone yet for a chat that may have one: fetch it in the
+        // background, so the chat's next notification has it. (This one isn't posted
+        // again with it: a repeat could reach the watch as a new notification.)
+        if (convo != null && convo.fetchPhoto && ownerSvc != null) {
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    val id = Avatars.notifId(convoId) ?: Avatars.lookupNotifId(ownerSvc, convoId) ?: return@launch
+                    Avatars.load(ctx, ownerSvc, id)
+                } catch (e: Throwable) {
+                    LogStore.w("MirrorMsgSpike", "Notification photo: ${e.message}")
+                }
+            }
+        }
+    }
+
+    // MirrorMsg's own notification glyph (the speech bubble) as the small icon: the
+    // badge on a conversation's picture. The stock envelope if the app has none.
+    private fun smallIcon(ctx: Context): Int =
+        ctx.resources.getIdentifier("ic_notification", "drawable", ctx.packageName)
+            .takeIf { it != 0 } ?: android.R.drawable.ic_dialog_email
+
+    // ---- Conversations (step 90, Android 11+) ---------------------------------------
+    // A MessagingStyle notification tied to a long-lived shortcut for the chat is a
+    // "conversation": the shade shows the shortcut's picture (the chat's photo, else
+    // its letter on its colour: the watch's avatar) with the app's badge, and the
+    // chat's name. Shortcuts are re-published only when the name or picture changes.
+    private class Convo(val style: Notification.MessagingStyle, val shortcutId: String,
+                        val fetchPhoto: Boolean)
+
+    private const val ICON_PX = 144
+    private val pushed = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    // [title] is the notification's own title (network, then sender): it's also the
+    // style's conversation title, which the phone doesn't show (the shortcut's name
+    // takes its place) but the Pebble app reads as the sender its notification
+    // history groups by, so the watch groups them as before (by that title).
+    @android.annotation.TargetApi(Build.VERSION_CODES.R)
+    private fun conversation(ctx: Context, convoId: String, sender: String, body: String,
+                             ownerServiceId: String, svc: MessagingService?, groupName: String,
+                             picture: android.graphics.Bitmap?, whenMs: Long,
+                             title: CharSequence): Convo? = try {
+        val chat = Avatars.chat(convoId)
+        val group = groupName.isNotEmpty() || chat?.group == true
+        // The chat's name: a server channel's "Server#channel", a group's name, else the person.
+        val label = when {
+            groupName.isNotEmpty() ->
+                (svc?.threadLabel(convoId)?.substringAfter('\n', "") ?: "").ifEmpty { groupName }
+            group && !chat?.name.isNullOrEmpty() -> chat!!.name
+            sender.isNotEmpty() -> sender
+            else -> chat?.name?.ifEmpty { null } ?: "Chat"
+        }
+        val photoId = Avatars.notifId(convoId)
+        val photo = photoId?.let { Avatars.cached(ctx, it) }
+        val color = chat?.color ?: svc?.avatarColorFor(convoId) ?: Avatars.DEFAULT_COLOR
+        val icon = Icon.createWithBitmap(
+            if (photo != null) Avatars.roundIcon(photo, ICON_PX)
+            else Avatars.letterIcon(if (group) label else (chat?.name?.ifEmpty { null } ?: label), color, ICON_PX))
+        val shortcutId = "mm:$convoId"
+        val them = Person.Builder().setName(label).setKey(shortcutId).setIcon(icon).build()
+        publishShortcut(ctx, shortcutId, label, icon, them, convoId, ownerServiceId,
+                        if (photo != null) "p:$photoId" else "l:$color")
+        val from = if (group) Person.Builder().setName(sender.ifEmpty { label })
+                                  .setKey("$shortcutId/$sender").build()
+                   else them
+        val style = Notification.MessagingStyle(Person.Builder().setName("You").setKey("mm:me").build())
+            .setGroupConversation(group)
+            .setConversationTitle(title)
+        if (picture != null) {
+            val m = Notification.MessagingStyle.Message("[Image]", whenMs, from)
+            Avatars.pictureUri(ctx, convoId, picture, whenMs)?.let { m.setData("image/jpeg", it) }
+            style.addMessage(m)
+            val cap = pictureCaption(body)
+            if (cap.isNotEmpty()) style.addMessage(Notification.MessagingStyle.Message(cap, whenMs, from))
+        } else {
+            style.addMessage(Notification.MessagingStyle.Message(body, whenMs, from))
+        }
+        Convo(style, shortcutId, fetchPhoto = photo == null && (photoId != null || !Avatars.notifIdKnown(convoId)))
+    } catch (e: Throwable) {
+        LogStore.w("MirrorMsgSpike", "Conversation notification not built: ${e.message}")
+        null
+    }
+
+    // The shortcut opens the chat as tapping its notification does: in the owning
+    // account's own app (the trampoline, by the serviceId baked in here).
+    @android.annotation.TargetApi(Build.VERSION_CODES.R)
+    private fun publishShortcut(ctx: Context, id: String, label: String, icon: Icon,
+                                person: Person, convoId: String, ownerServiceId: String, sig: String) {
+        if (pushed[id] == "$label|$ownerServiceId|$sig") return
+        try {
+            val sm = ctx.getSystemService(ShortcutManager::class.java) ?: return
+            val intent = Intent(ctx, OpenInAppActivity::class.java).setAction(Intent.ACTION_VIEW)
+                .putExtra(EXTRA_CONVO_ID, convoId)
+                .putExtra(EXTRA_SERVICE_ID, ownerServiceId)
+            sm.pushDynamicShortcut(ShortcutInfo.Builder(ctx, id)
+                .setShortLabel(label.take(40).ifEmpty { "Chat" })
+                .setLongLived(true)
+                .setIntent(intent)
+                .setIcon(icon)
+                .setPerson(person)
+                .setCategories(setOf(ShortcutInfo.SHORTCUT_CATEGORY_CONVERSATION))
+                .build())
+            pushed[id] = "$label|$ownerServiceId|$sig"
+        } catch (e: Throwable) {
+            LogStore.w("MirrorMsgSpike", "Conversation shortcut not published: ${e.message}")
+        }
     }
 
     /** Dismiss the current new-message notification. Used when a message that
      *  was first notified as text turns out to be an image and instead
      *  force-opens the watch — so the stale "new message" banner goes away. */
-    fun cancel(ctx: Context) {
+    /** Clear a specific conversation's notification (e.g. on mark-read / open). */
+    fun cancel(ctx: Context, convoId: String) {
         val mgr = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        mgr.cancel(NOTIF_ID)
+        mgr.cancel(notifIdFor(convoId))
     }
 }

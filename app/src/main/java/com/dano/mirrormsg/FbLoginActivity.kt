@@ -81,8 +81,11 @@ class FbLoginActivity : Activity() {
                 val signedIn = cookieUrls.any {
                     cm.getCookie(it)?.contains(SIGNED_IN_MARKER) == true
                 }
-                // Live progress: shows whether login is detected yet.
-                LogStore.i(TAG, "FbLogin page done: $url (c_user present: $signedIn)")
+                // Live progress: shows whether login is detected yet. Host and
+                // path only: a login page's query can carry an address or a token.
+                val where = url?.let { runCatching { java.net.URI(it) }.getOrNull() }
+                    ?.let { "${it.host}${it.path}" } ?: "?"
+                LogStore.i(TAG, "FbLogin page done: $where (c_user present: $signedIn)")
                 if (handled) return
                 if (signedIn) {
                     cm.flush()

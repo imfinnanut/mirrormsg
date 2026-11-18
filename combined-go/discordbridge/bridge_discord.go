@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -39,7 +40,8 @@ import (
 	"sync"
 	"time"
 
-	"fi.mirrormsg/mirrorbridge" // shared scale + 4bpp palettize encoder (image serving)
+	"fi.mirrormsg/mediaroute"
+	"fi.mirrormsg/watchimage" // shared scale + palettize/variable-depth encoder (image serving)
 
 	"github.com/bwmarrin/discordgo" // resolves to github.com/beeper/discordgo via go.mod replace
 )
@@ -103,6 +105,9 @@ type outMediaContent struct {
 	Format   string `json:"format"`
 	MimeType string `json:"mimeType"`
 	MediaID  string `json:"mediaID"`
+	// PosterMediaID is a still of a video's first frame (a url): the watch shows
+	// it in the chat row with the video icon over it.
+	PosterMediaID string `json:"posterMediaID,omitempty"`
 }
 type outMsgInfo struct {
 	MessageContent outContent       `json:"messageContent"`
@@ -135,7 +140,12 @@ type outMsg struct {
 }
 type outMsgs struct {
 	Messages []outMsg `json:"messages"`
-	DcError  string   `json:"dcError,omitempty"`
+	// Cursor is the pagination anchor for infinite backfill: the id of the OLDEST
+	// message in this batch. The phone stores it and passes it back as `before` to
+	// fetch the next older page. Empty (omitted) = true top-of-channel -> backfill
+	// stops. Same round-trip contract as every other native network's cursor.
+	Cursor  string `json:"cursor,omitempty"`
+	DcError string `json:"dcError,omitempty"`
 }
 
 // Guild list for the phone's server-picker (amber reveal) panel — mirrors
@@ -179,6 +189,9 @@ type Bridge struct {
 	dmName      map[string]string
 	dmRecipient map[string]string
 	dmOrder     []string
+	// dmAvatar: a DM's photo (the other person's avatar, a group DM's icon) by
+	// channel id, as a CDN address (AvatarURL, step 90). No entry = none.
+	dmAvatar map[string]string
 
 	// Guilds: id -> name / icon, and each guild's text channels.
 	guildName    map[string]string
@@ -192,6 +205,11 @@ type Bridge struct {
 	// it, so it stays browsable. Populated from READY's user_guild_settings and kept
 	// live via UserGuildSettingsUpdate.
 	guildMutes map[string]*dcGuildMute
+	// guildDefaults holds each guild's SERVER-level default notification setting
+	// (guild.DefaultMessageNotifications: 0=all, 1=@only). Discord omits a personal
+	// user_guild_settings entry for guilds you've never customized, so the effective
+	// level for those is the server default — GuildNotifyLevel falls back to this.
+	guildDefaults map[string]int
 	// guildChannels holds each guild's text-channel ids in display order (by
 	// Discord channel Position), so a selected server lists its channels in the
 	// same order the Discord client shows them rather than random map order.
@@ -206,12 +224,23 @@ type Bridge struct {
 	// activity or is opened.
 	lastText map[string]string
 
-	// imageURL caches the CDN URL of an image attachment per messageID, so a later
-	// DownloadImageForWatch(messageID) can fetch + scale it on demand. Populated in
-	// buildOutMsg (live + history) with no extra REST. Discord signs these URLs with
-	// a ~24h expiry, which is fine for the open-thread-then-view-image flow; a stale
-	// URL just 403s and a reopen re-caches a fresh one.
+	// imageURL caches the CDN URL of each picture attachment by its media id (the
+	// message's id, or "<message id>:<attachment id>" for a message's later pictures:
+	// see pictures), so a later DownloadImageForWatch(id) can fetch + scale it on
+	// demand. Populated in buildOutMsg (live + history) with no extra REST. It lives
+	// in memory only, and Discord signs these URLs with a ~24h expiry: a chat the
+	// phone shows from its store asks for pictures before the thread fetch has
+	// refilled it, and an old URL 403s. RecoverImage re-learns them on demand.
 	imageURL map[string]string
+	// imageFresh marks when RecoverImage last asked Discord about a message id (found or
+	// not), so a burst of requests around one spot makes one REST call, not one each.
+	imageFresh map[string]time.Time
+	// recoverMu serializes RecoverImage's REST calls (and relearnAudio's).
+	recoverMu sync.Mutex
+	// audioURL caches the CDN URL of a voice message (any sound attachment) per
+	// messageID, as imageURL does for pictures. The phone fetches the file through
+	// DownloadMediaToFile, which re-learns a missing or expired one (step 86).
+	audioURL map[string]string
 
 	// enabledGuilds is the opt-in set. Empty by default => only DMs flow.
 	enabledGuilds map[string]bool
@@ -223,6 +252,7 @@ func NewDiscordBridge() *Bridge {
 	return &Bridge{
 		dmName:        map[string]string{},
 		dmRecipient:   map[string]string{},
+		dmAvatar:      map[string]string{},
 		guildName:     map[string]string{},
 		guildIcon:     map[string]string{},
 		channelGuild:  map[string]string{},
@@ -231,6 +261,8 @@ func NewDiscordBridge() *Bridge {
 		forumChannels: map[string]bool{},
 		lastText:      map[string]string{},
 		imageURL:      map[string]string{},
+		imageFresh:    map[string]time.Time{},
+		audioURL:      map[string]string{},
 		guildMutes:    map[string]*dcGuildMute{},
 		enabledGuilds: map[string]bool{},
 	}
@@ -334,6 +366,7 @@ func (b *Bridge) Close() {
 	b.selfName = ""
 	b.dmName = map[string]string{}
 	b.dmRecipient = map[string]string{}
+	b.dmAvatar = map[string]string{}
 	b.dmOrder = nil
 	b.guildName = map[string]string{}
 	b.guildIcon = map[string]string{}
@@ -344,7 +377,10 @@ func (b *Bridge) Close() {
 	b.forumChannels = map[string]bool{}
 	b.lastText = map[string]string{}
 	b.imageURL = map[string]string{}
+	b.imageFresh = map[string]time.Time{}
+	b.audioURL = map[string]string{}
 	b.guildMutes = map[string]*dcGuildMute{}
+	b.guildDefaults = map[string]int{}
 	b.mu.Unlock()
 	if s != nil {
 		_ = s.Close()
@@ -401,6 +437,10 @@ func (b *Bridge) SetEnabledGuilds(idsCSV string) {
 	b.mu.Lock()
 	b.enabledGuilds = set
 	b.mu.Unlock()
+	// Newly-enabled large guilds need an op-14 subscription before Discord will stream
+	// their messages. This fires on the phone's post-READY push (cold connect) and on
+	// every toggle. Goroutine: subscribeEnabledGuilds spaces its gateway sends.
+	go b.subscribeEnabledGuilds()
 }
 
 func (b *Bridge) fail(msg string) string {
@@ -424,6 +464,11 @@ func (b *Bridge) onEvent(i any) {
 	switch e := i.(type) {
 	case *discordgo.Ready:
 		b.onReady(e)
+	case *discordgo.Resumed:
+		// A RESUME replays missed events but does NOT re-fire READY, so the op-14
+		// guild subscriptions from the dropped connection are gone. Re-send them or
+		// large enabled guilds go silent again after any resume.
+		go b.subscribeEnabledGuilds()
 	case *discordgo.MessageCreate:
 		b.onMessageCreate(e)
 	case *discordgo.MessageReactionAdd:
@@ -463,6 +508,7 @@ func (b *Bridge) onReady(r *discordgo.Ready) {
 	}
 	b.dmName = map[string]string{}
 	b.dmRecipient = map[string]string{}
+	b.dmAvatar = map[string]string{}
 	b.dmOrder = b.dmOrder[:0]
 	// Order DMs / group-DMs most-recent-first by LastMessageID (a snowflake whose
 	// high bits encode a timestamp, so higher = newer). The phone renders
@@ -486,6 +532,9 @@ func (b *Bridge) onReady(r *discordgo.Ready) {
 		if rid := primaryRecipient(ch); rid != "" {
 			b.dmRecipient[ch.ID] = rid
 		}
+		if u := dmAvatarURL(ch); u != "" {
+			b.dmAvatar[ch.ID] = u
+		}
 		b.dmOrder = append(b.dmOrder, ch.ID)
 	}
 	b.guildName = map[string]string{}
@@ -496,6 +545,7 @@ func (b *Bridge) onReady(r *discordgo.Ready) {
 	b.guildChannels = map[string][]string{}
 	b.forumChannels = map[string]bool{}
 	b.guildMutes = map[string]*dcGuildMute{}
+	b.guildDefaults = map[string]int{}
 	if r.UserGuildSettings != nil {
 		for _, gs := range r.UserGuildSettings.Entries {
 			b.applyGuildSettingsLocked(gs)
@@ -507,9 +557,43 @@ func (b *Bridge) onReady(r *discordgo.Ready) {
 	b.ready = true
 	dmN, gN := len(b.dmOrder), len(b.guildOrder)
 	uname := b.selfName
+	// DIAG: measure user_guild_settings snapshot coverage. A capped READY snapshot
+	// leaves some guilds with no guildMutes entry, so their notify level/mute read
+	// as defaults (All / not-muted) AND their non-mention messages aren't silenced.
+	// Count loaded entries (excluding the "" DM bucket) and collect the names of
+	// guilds with NO settings entry, to see the cap's scale and whether the missing
+	// set skews toward low-recency guilds.
+	settingsN := 0
+	for gid := range b.guildMutes {
+		if gid != "" {
+			settingsN++
+		}
+	}
+	var missingGuilds []string
+	for _, gid := range b.guildOrder {
+		if b.guildMutes[gid] == nil {
+			nm := b.guildName[gid]
+			if nm == "" {
+				nm = gid
+			}
+			missingGuilds = append(missingGuilds, nm)
+		}
+	}
 	b.mu.Unlock()
 
 	b.emitEvent("DIAG", fmt.Sprintf("discord READY user=%s dms=%d guilds=%d", uname, dmN, gN))
+	b.emitEvent("DIAG", fmt.Sprintf("discord SETTINGS coverage: loaded=%d/%d guilds, missing=%d", settingsN, gN, len(missingGuilds)))
+	if len(missingGuilds) > 0 {
+		b.emitEvent("DIAG", "discord SETTINGS missing (no notify/mute entry): "+strings.Join(missingGuilds, " | "))
+	}
+
+	// Op-14 subscribe every enabled guild so large servers start streaming live
+	// messages (they don't push to a user connection until subscribed). Goroutine:
+	// this runs in the gateway dispatch path and subscribeEnabledGuilds sleeps between
+	// sends. On a first cold connect enabledGuilds may still be empty here (the phone
+	// pushes it just after READY) — that path is covered by SetEnabledGuilds; this call
+	// covers full reconnects where the set is already populated.
+	go b.subscribeEnabledGuilds()
 }
 
 func (b *Bridge) onMessageCreate(m *discordgo.MessageCreate) {
@@ -523,6 +607,14 @@ func (b *Bridge) onMessageCreate(m *discordgo.MessageCreate) {
 	txt := displayTextOf(m.Message)
 	b.mu.Lock()
 	b.lastText[m.ChannelID] = txt
+	// A DM that opened since READY: its photo is the sender's (step 90).
+	if _, known := b.dmName[m.ChannelID]; !known && m.GuildID == "" && m.Author != nil && m.Author.ID != b.selfID {
+		if _, has := b.dmAvatar[m.ChannelID]; !has {
+			if u := userAvatarURL(m.Author); u != "" {
+				b.dmAvatar[m.ChannelID] = u
+			}
+		}
+	}
 	b.mu.Unlock()
 	bs, err := json.Marshal(b.buildOutMsg(m.Message))
 	if err != nil {
@@ -540,6 +632,40 @@ func (b *Bridge) channelAllowed(channelID, guildID string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.enabledGuilds[guildID]
+}
+
+// subscribeEnabledGuilds sends a gateway op-14 guild subscription for every enabled
+// guild so Discord starts streaming live events (MESSAGE_CREATE, typing, threads) for
+// them. Large guilds do NOT push messages to a user connection until subscribed —
+// small/medium guilds stream passively, which is why only big enabled servers (e.g.
+// Subnautica) went silent while smaller ones worked. Payload mirrors mautrix-discord's
+// proven pattern on this same fork. Idempotent and safe to call repeatedly: on READY,
+// on RESUME, and whenever the enabled set changes. It issues its own gateway sends
+// (spaced to stay gentle on the socket), so callers should invoke it in a goroutine to
+// avoid blocking the dispatch loop.
+func (b *Bridge) subscribeEnabledGuilds() {
+	b.mu.Lock()
+	s := b.session
+	ids := make([]string, 0, len(b.enabledGuilds))
+	for gid := range b.enabledGuilds {
+		ids = append(ids, gid)
+	}
+	b.mu.Unlock()
+	if s == nil || len(ids) == 0 {
+		return
+	}
+	for _, gid := range ids {
+		err := s.SubscribeGuild(discordgo.GuildSubscribeData{
+			GuildID:    gid,
+			Typing:     true,
+			Activities: true,
+			Threads:    true,
+		})
+		if err != nil {
+			b.emitEvent("DIAG", fmt.Sprintf("DC-SUB guild=%s err=%v", gid, err))
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
 }
 
 // onReaction turns a live gateway reaction add/remove into the standard per-actor
@@ -612,9 +738,12 @@ func (b *Bridge) applyGuildSettingsLocked(gs *discordgo.UserGuildSettings) {
 // per-server mute button so it reflects Discord's real mute.
 func (b *Bridge) IsGuildMuted(guildID string) bool {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	gs := b.guildMutes[guildID]
-	return gs != nil && gs.muted
+	present := gs != nil
+	muted := gs != nil && gs.muted
+	b.mu.Unlock()
+	b.emitEvent("DIAG", fmt.Sprintf("DC getMuted guild=%s entry=%v muted=%v", guildID, present, muted))
+	return muted
 }
 
 // SetGuildMute sets the user's REAL Discord mute for a guild (so it also shows muted
@@ -661,12 +790,24 @@ func (b *Bridge) SetGuildMute(guildID string, muted bool) string {
 // override or the stored value is out of range. Seeds the 3-way notify selector.
 func (b *Bridge) GuildNotifyLevel(guildID string) int {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	gs := b.guildMutes[guildID]
-	if gs == nil || gs.level < 0 || gs.level > 2 {
-		return 0
+	// Personal override wins (levels 0=all,1=@,2=none). A personal "inherit"
+	// value (3) or no personal entry falls through to the server default. If the
+	// guild isn't even registered (no default known), return -1 = unknown so the
+	// UI can show a dim/unavailable state rather than a wrong "all".
+	lvl := -1
+	source := "unknown"
+	if gs != nil && gs.level >= 0 && gs.level <= 2 {
+		lvl = gs.level
+		source = "personal"
+	} else if def, ok := b.guildDefaults[guildID]; ok {
+		lvl = def
+		source = "default"
 	}
-	return gs.level
+	present := gs != nil
+	b.mu.Unlock()
+	b.emitEvent("DIAG", fmt.Sprintf("DC getNotify guild=%s personal=%v src=%s level=%d", guildID, present, source, lvl))
+	return lvl
 }
 
 // SetGuildNotifyLevel sets the user's REAL Discord notification level for a guild
@@ -716,6 +857,9 @@ func (b *Bridge) registerGuildLocked(g *discordgo.Guild) {
 	_, known := b.guildName[g.ID]
 	b.guildName[g.ID] = g.Name
 	b.guildIcon[g.ID] = g.Icon
+	// Server-level default notify (0=all, 1=@only), the effective level for any
+	// guild the user hasn't personally overridden.
+	b.guildDefaults[g.ID] = int(g.DefaultMessageNotifications)
 	if !known {
 		b.guildOrder = append(b.guildOrder, g.ID)
 	}
@@ -822,10 +966,17 @@ func (b *Bridge) ListConversations(limit int) string {
 	return string(bs)
 }
 
-// FetchMessages pulls recent history for a conversation as {"messages":[outMsg...]},
-// oldest-first (Discord returns newest-first; we reverse to match every other
-// network). limit is capped at 100 by the Discord API.
-func (b *Bridge) FetchMessages(conversationID string, limit int) string {
+// FetchMessages pulls history for a conversation as {"messages":[outMsg...],"cursor":"<id>"},
+// oldest-first (Discord returns newest-first; we reverse to match every other network).
+//
+// `before` is the infinite-backfill pagination anchor: empty fetches the NEWEST page;
+// a message id fetches the page strictly OLDER than it (Discord's before= param). The
+// returned "cursor" is the id of the OLDEST message in this batch — the phone passes it
+// back as `before` for the next older page. An empty cursor (a short page: fewer than
+// `limit` returned) means true top-of-channel, so backfill stops.
+//
+// limit is capped at 100 by the Discord API.
+func (b *Bridge) FetchMessages(conversationID string, limit int, before string) string {
 	channelID := strings.TrimPrefix(conversationID, convoIDPrefix)
 	if channelID == conversationID || channelID == "" {
 		return b.msgsErr("not a discord conversation id")
@@ -839,12 +990,15 @@ func (b *Bridge) FetchMessages(conversationID string, limit int) string {
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
-	msgs, err := s.ChannelMessages(channelID, limit, "", "", "")
+	msgs, err := s.ChannelMessages(channelID, limit, before, "", "")
 	if err != nil {
 		return b.msgsErr(err.Error())
 	}
-	// Seed the list snippet from the newest message (Discord returns newest-first).
-	if len(msgs) > 0 && msgs[0] != nil {
+	// Seed the list snippet from the newest message (Discord returns newest-first) —
+	// ONLY on the newest-page fetch (before==""). On a backfill page (before set),
+	// msgs[0] is the newest of an OLDER page, not the channel's newest, so seeding the
+	// convo-list snippet from it would show stale text in the conversation list.
+	if before == "" && len(msgs) > 0 && msgs[0] != nil {
 		txt := displayTextOf(msgs[0])
 		b.mu.Lock()
 		b.lastText[channelID] = txt
@@ -855,6 +1009,14 @@ func (b *Bridge) FetchMessages(conversationID string, limit int) string {
 		if msgs[i] != nil {
 			out.Messages = append(out.Messages, b.buildOutMsg(msgs[i]))
 		}
+	}
+	// Advertise a cursor only when Discord returned a FULL page (len(msgs) >= limit):
+	// a short page means we reached the top, so cursor stays empty and backfill stops.
+	// The anchor is the OLDEST message in the batch — out.Messages is oldest-first, so
+	// element [0]. (Base the "more exists" test on the raw count, but take the cursor
+	// value from an actually-built message in case a raw entry was nil.)
+	if len(msgs) >= limit && len(out.Messages) > 0 {
+		out.Cursor = out.Messages[0].MessageID
 	}
 	bs, _ := json.Marshal(out)
 	return string(bs)
@@ -885,6 +1047,33 @@ func (b *Bridge) SendMessage(conversationID, text string) string {
 	return string(bs)
 }
 
+// MarkThreadRead marks a Discord conversation (channel) read up through messageID
+// via ChannelMessageAck. A Discord "conversation" is a channel — DM, group DM, or
+// guild text channel — all acked the same way, so no guild/DM split is needed.
+// Read state is per-channel with the ack'd message as the high-water mark, so
+// acking the newest message clears the channel's unread + mention badge. The
+// empty lastToken is the standard one-shot ack (no continuation).
+func (b *Bridge) MarkThreadRead(conversationID, messageID string) string {
+	channelID := strings.TrimPrefix(conversationID, convoIDPrefix)
+	if channelID == conversationID || channelID == "" {
+		return b.fail("not a discord conversation id")
+	}
+	if messageID == "" {
+		return b.fail("no message id")
+	}
+	b.mu.Lock()
+	s := b.session
+	b.mu.Unlock()
+	if s == nil {
+		return b.fail("not started")
+	}
+	if _, err := s.ChannelMessageAck(channelID, messageID, ""); err != nil {
+		return b.fail(err.Error())
+	}
+	bs, _ := json.Marshal(map[string]interface{}{"ok": true, "channelID": channelID, "messageID": messageID})
+	return string(bs)
+}
+
 // SendReply sends text as a reply quoting replyToMessageID in the conversation,
 // mirroring bridge_tg.go's SendReply. Returns {"ok":true,"messageID":...} or
 // {"dcError":"..."}.
@@ -912,9 +1101,11 @@ func (b *Bridge) SendReply(conversationID, replyToMessageID, text string) string
 	return string(bs)
 }
 
-// SendReaction adds (remove=false) or removes (remove=true) a reaction on a
-// message. emoji is the raw unicode emoji; the Discord API takes it directly as the
-// reaction identifier. Returns {"ok":true} or {"dcError":"..."}.
+// SendReaction adds (remove=false) or removes (remove=true) the user's own reaction
+// on a message. emoji is the raw unicode emoji; the Discord API takes it directly as
+// the reaction identifier. A removal goes to "@me" (Delete Own Reaction); the form
+// with a user id is for removing someone else's, and needs Manage Messages. Returns
+// {"ok":true} or {"dcError":"..."}.
 func (b *Bridge) SendReaction(conversationID, messageID, emoji string, remove bool) string {
 	channelID := strings.TrimPrefix(conversationID, convoIDPrefix)
 	if channelID == conversationID || channelID == "" {
@@ -922,14 +1113,13 @@ func (b *Bridge) SendReaction(conversationID, messageID, emoji string, remove bo
 	}
 	b.mu.Lock()
 	s := b.session
-	self := b.selfID
 	b.mu.Unlock()
 	if s == nil {
 		return b.fail("not started")
 	}
 	var err error
 	if remove {
-		err = s.MessageReactionRemove(channelID, messageID, emoji, self)
+		err = s.MessageReactionRemove(channelID, messageID, emoji, "@me")
 	} else {
 		err = s.MessageReactionAdd(channelID, messageID, emoji)
 	}
@@ -947,18 +1137,19 @@ func errJSON(msg string) string {
 	return string(bs)
 }
 
-// DownloadImageForWatch fetches the cached CDN url for msgID and hands the bytes to
-// the SHARED mirrorbridge encoder (scale + 4bpp palettize) so Discord images render
-// identically to Google/WhatsApp/Telegram. Returns {"w","h","pixels","fmt","palette"}
-// or {"error":...}. maxBytes>0 is the enhanced-view heap budget; ==0 is the small
-// chat-preview box. The url was cached in buildOutMsg on fetch/live; a signed url that
-// has expired 403s here and a thread reopen re-caches a fresh one.
-func (b *Bridge) DownloadImageForWatch(msgID string, maxW, maxH, maxBytes, quality int) string {
+// DownloadImageForWatch fetches the cached CDN url of picture mediaID (see pictures)
+// and hands the bytes to the SHARED watchimage encoder (scale + palettize) so Discord
+// images render identically to Google/WhatsApp/Telegram. Returns
+// {"w","h","pixels","fmt","palette"} or {"error":...}. maxBytes>0 is the enhanced-view
+// heap budget; ==0 is the small chat-preview box. The url was cached in buildOutMsg on
+// fetch/live; a signed url that has expired 403s here and a thread reopen re-caches a
+// fresh one.
+func (b *Bridge) DownloadImageForWatch(mediaID string, maxW, maxH, maxBytes, quality int) string {
 	b.mu.Lock()
-	url := b.imageURL[msgID]
+	url := b.imageURL[mediaID]
 	b.mu.Unlock()
 	if url == "" {
-		return errJSON("no stored image for " + msgID)
+		return errJSON("no stored image for " + mediaID)
 	}
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Get(url)
@@ -973,11 +1164,205 @@ func (b *Bridge) DownloadImageForWatch(msgID string, maxW, maxH, maxBytes, quali
 	if err != nil {
 		return errJSON("read: " + err.Error())
 	}
-	out, err := mirrorbridge.EncodeImageForWatch(data, maxW, maxH, maxBytes, quality)
+	out, err := watchimage.EncodeImageForWatch(data, maxW, maxH, maxBytes, quality)
 	if err != nil {
 		return errJSON("encode: " + err.Error())
 	}
 	return out
+}
+
+// DownloadMediaForWatch is DownloadImageForWatch's unified twin: identical CDN
+// fetch, but mediaroute decides from the BYTES whether to encode an animation or
+// a still, and wraps the reply as {"kind","data"}. Only the fetch is Discord-
+// specific; the decision is shared with every other bridge.
+//
+// Returns "" (not an error JSON) on any failure, because the caller reads empty
+// as "fall back to the still path" — the right outcome for every problem here.
+func (b *Bridge) DownloadMediaForWatch(mediaID string,
+	maxW, maxH, maxBytes, quality, fpsFloor, maxFrames, gifBytes, startRung int) string {
+	b.mu.Lock()
+	url := b.imageURL[mediaID]
+	b.mu.Unlock()
+	if url == "" {
+		return ""
+	}
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return ""
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	out, err := mediaroute.Encode(data, maxW, maxH, maxBytes, quality,
+		fpsFloor, maxFrames, gifBytes, startRung)
+	if err != nil {
+		return ""
+	}
+	return out
+}
+
+// RecoverImage re-learns the CDN URLs of the pictures of the message mediaID belongs
+// to, and those of the messages around it, from Discord: one REST call (up to 50
+// messages). mediaID is a picture's media id (pictures: the message's id, or
+// "<message id>:<attachment id>" for an album's later pictures). The URL cache is in
+// memory only, so after a phone restart a chat shown from the phone's store asks for
+// its pictures before the thread fetch has refilled it; and a cached URL whose ~24h
+// signature has expired 403s. The phone calls this when a download fails, then tries
+// once more.
+//
+// Calls are serialized; one for a message asked about within the last minute (by
+// another call's batch, say) answers from the cache without a REST call. Returns
+// whether mediaID's picture URL is known now.
+func (b *Bridge) RecoverImage(conversationID, mediaID string) bool {
+	channelID := strings.TrimPrefix(conversationID, convoIDPrefix)
+	msgID, _, _ := strings.Cut(mediaID, ":")
+	if channelID == conversationID || channelID == "" || snowflake(msgID) == 0 {
+		return false
+	}
+	b.recoverMu.Lock()
+	defer b.recoverMu.Unlock()
+	b.mu.Lock()
+	s := b.session
+	at, asked := b.imageFresh[msgID]
+	known := b.imageURL[mediaID] != ""
+	b.mu.Unlock()
+	if asked && time.Since(at) < time.Minute {
+		return known
+	}
+	if s == nil {
+		return false
+	}
+	msgs, err := s.ChannelMessages(channelID, 50, "", "", msgID)
+	if err != nil {
+		b.emitEvent("DIAG", "DC image recover failed: "+err.Error())
+		return false
+	}
+	now := time.Now()
+	n := 0
+	b.mu.Lock()
+	for _, m := range msgs {
+		as, ids := pictures(m)
+		for k, a := range as {
+			b.imageURL[ids[k]] = attachmentURL(a)
+		}
+		if len(as) > 0 {
+			b.imageFresh[m.ID] = now
+		}
+		n += len(as)
+	}
+	b.imageFresh[msgID] = now
+	known = b.imageURL[mediaID] != ""
+	b.mu.Unlock()
+	b.emitEvent("DIAG", fmt.Sprintf("DC image recover: %d pictures relearned, asked one found=%v", n, known))
+	return known
+}
+
+// maxAudioBytes refuses anything absurd before it's read in (the other bridges' cap).
+const maxAudioBytes = 64 * 1024 * 1024
+
+// DownloadMediaToFile writes a voice message's file (any sound attachment) to path,
+// for the watch's voice-note player (step 86). mediaID is "<channel id>/<message id>"
+// (buildOutMsg). The link is the one last seen; Discord signs links for about a day
+// and they're kept in memory only, so a missing or refused one is re-learnt from
+// Discord (the messages around it: one REST call) and tried once more. Returns the
+// byte count, or -1 with a DIAG saying why.
+func (b *Bridge) DownloadMediaToFile(mediaID, path string) int64 {
+	channelID, msgID, ok := strings.Cut(mediaID, "/")
+	if !ok || snowflake(channelID) == 0 || snowflake(msgID) == 0 {
+		b.emitEvent("DIAG", "DC voice: not a voice message id")
+		return -1
+	}
+	b.mu.Lock()
+	url := b.audioURL[msgID]
+	b.mu.Unlock()
+	if url != "" {
+		n, status := saveTo(url, path)
+		if n > 0 {
+			return n
+		}
+		if status != 403 && status != 404 && status != 410 {
+			b.emitEvent("DIAG", fmt.Sprintf("DC voice: download failed (http %d)", status))
+			return -1
+		}
+	}
+	fresh := b.relearnAudio(channelID, msgID, url)
+	if fresh == "" {
+		b.emitEvent("DIAG", "DC voice: Discord has no file for it")
+		return -1
+	}
+	n, status := saveTo(fresh, path)
+	if n <= 0 {
+		b.emitEvent("DIAG", fmt.Sprintf("DC voice: download failed after relearning (http %d)", status))
+		return -1
+	}
+	return n
+}
+
+// relearnAudio asks Discord for the messages around msgID (one REST call, serialized
+// with RecoverImage's) and keeps the fresh link of every sound attachment among them.
+// Returns msgID's, or "". stale is the link that failed (or ""): one another call
+// has replaced meanwhile is used without asking again.
+func (b *Bridge) relearnAudio(channelID, msgID, stale string) string {
+	b.recoverMu.Lock()
+	defer b.recoverMu.Unlock()
+	b.mu.Lock()
+	s := b.session
+	if u := b.audioURL[msgID]; u != "" && u != stale {
+		b.mu.Unlock()
+		return u
+	}
+	b.mu.Unlock()
+	if s == nil {
+		return ""
+	}
+	msgs, err := s.ChannelMessages(channelID, 50, "", "", msgID)
+	if err != nil {
+		b.emitEvent("DIAG", "DC voice relearn failed: "+err.Error())
+		return ""
+	}
+	n := 0
+	b.mu.Lock()
+	for _, m := range msgs {
+		if a := audioAttachment(m); a != nil {
+			b.audioURL[m.ID] = attachmentURL(a)
+			n++
+		}
+	}
+	url := b.audioURL[msgID]
+	if url == stale {
+		url = ""
+	}
+	b.mu.Unlock()
+	b.emitEvent("DIAG", fmt.Sprintf("DC voice relearn: %d relearned, asked one found=%v", n, url != ""))
+	return url
+}
+
+// saveTo downloads url to path: the byte count (-1 on any failure) and the HTTP
+// status (0 when there was none).
+func saveTo(url, path string) (int64, int) {
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return -1, 0
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return -1, resp.StatusCode
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAudioBytes+1))
+	if err != nil || len(data) == 0 || len(data) > maxAudioBytes {
+		return -1, resp.StatusCode
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return -1, resp.StatusCode
+	}
+	return int64(len(data)), resp.StatusCode
 }
 
 // GuildForChannel returns the guild id that owns a channel, or "" for a DM or an
@@ -1017,6 +1402,65 @@ func (b *Bridge) ListGuilds() string {
 	}
 	bs, _ := json.Marshal(out)
 	return string(bs)
+}
+
+// ---- Contact photos (step 90) -----------------------------------------------
+
+// AvatarURL returns the address of the picture a conversation shows (the phone's
+// notification, the watch's chat list): a DM's other person's avatar, a group DM's
+// icon, a server channel's server icon; "guild:<id>" is the server itself. 256 px
+// PNGs from Discord's CDN (an animated one gives its first frame); the address
+// carries the image's hash, so it changes when the picture does. "" when there's
+// none (a default avatar counts as none: the letter shows instead).
+func (b *Bridge) AvatarURL(id string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if gid, ok := strings.CutPrefix(id, "guild:"); ok {
+		return guildIconURL(gid, b.guildIcon[gid])
+	}
+	ch := strings.TrimPrefix(id, convoIDPrefix)
+	if u := b.dmAvatar[ch]; u != "" {
+		return u
+	}
+	if gid := b.channelGuild[ch]; gid != "" {
+		return guildIconURL(gid, b.guildIcon[gid])
+	}
+	return ""
+}
+
+const (
+	discordCDN    = "https://cdn.discordapp.com/"
+	avatarURLSize = ".png?size=256"
+)
+
+func userAvatarURL(u *discordgo.User) string {
+	if u == nil || u.ID == "" || u.Avatar == "" {
+		return ""
+	}
+	return discordCDN + "avatars/" + u.ID + "/" + u.Avatar + avatarURLSize
+}
+
+func guildIconURL(guildID, icon string) string {
+	if guildID == "" || icon == "" {
+		return ""
+	}
+	return discordCDN + "icons/" + guildID + "/" + icon + avatarURLSize
+}
+
+// dmAvatarURL: a group DM's icon, else the (first) other person's avatar.
+func dmAvatarURL(ch *discordgo.Channel) string {
+	if ch.Type == discordgo.ChannelTypeGroupDM {
+		if ch.Icon == "" {
+			return ""
+		}
+		return discordCDN + "channel-icons/" + ch.ID + "/" + ch.Icon + avatarURLSize
+	}
+	for _, r := range ch.Recipients {
+		if r != nil {
+			return userAvatarURL(r)
+		}
+	}
+	return ""
 }
 
 // ListGuildChannels returns one guild's text channels as {"conversations":[...]},
@@ -1118,11 +1562,176 @@ func (b *Bridge) msgsErr(msg string) string {
 	return string(bs)
 }
 
-// scalableImage returns the first attachment that is a raster image the shared
-// encoder handles (jpeg/png/webp — webp included because WhatsApp's webp stickers
-// scale through the same mirrorbridge encoder). Animated GIFs are excluded: the
-// watch can't animate them, so a [GIF] label reads better than a frozen frame.
-func scalableImage(m *discordgo.Message) *discordgo.MessageAttachment {
+// isPicture says whether attachment a is a raster image the shared encoder handles
+// (jpeg/png/webp/gif — webp included because WhatsApp's webp stickers scale through
+// the same watchimage encoder).
+//
+// Animated GIFs used to be excluded here, on the grounds that a [GIF] label read
+// better than a frozen frame. The watch animates them now, so they go through
+// like any other image: mediaroute decides from the BYTES whether a download is
+// an animation or a still, and a single-frame GIF comes back as a still.
+func isPicture(a *discordgo.MessageAttachment) bool {
+	if a == nil {
+		return false
+	}
+	switch a.ContentType {
+	case "image/jpeg", "image/png", "image/webp", "image/gif":
+		return true
+	}
+	return false
+}
+
+// pictures lists message m's pictures in the order they were attached, each with its
+// media id: the message's id for the first (the id a picture has always had, so the
+// pictures the phone stored before keep loading), "<message id>:<attachment id>" for
+// the rest (step 88: every picture of a message goes to the watch, as an album).
+// DownloadImageForWatch, DownloadMediaForWatch and RecoverImage key on these ids.
+func pictures(m *discordgo.Message) (as []*discordgo.MessageAttachment, ids []string) {
+	if m == nil {
+		return nil, nil
+	}
+	for i, a := range m.Attachments {
+		if !isPicture(a) {
+			continue
+		}
+		id := m.ID
+		if len(as) > 0 {
+			if a.ID != "" {
+				id = m.ID + ":" + a.ID
+			} else {
+				id = m.ID + ":" + strconv.Itoa(i)
+			}
+		}
+		as = append(as, a)
+		ids = append(ids, id)
+	}
+	return as, ids
+}
+
+// embedMedia returns the media Discord itself resolved for a LINK in the message,
+// and whether it is a video. A GIF picked from a picker is a link, not an upload:
+// Discord's own picker sends klipy.com/gifs/..., others tenor.com/view/... . The
+// real client shows the GIF because Discord unfurls the link and hands back the
+// file in the embed — so this reads the same embed rather than guessing from the
+// url. Only embeds that actually carry a GIF or a short clip qualify; an article
+// preview keeps its link text.
+func embedMedia(m *discordgo.Message) (url string, isVideo bool) {
+	if m == nil {
+		return "", false
+	}
+	for _, e := range m.Embeds {
+		if e == nil {
+			continue
+		}
+		kind := strings.ToLower(string(e.Type))
+		if kind != "gifv" && kind != "image" && kind != "video" {
+			continue
+		}
+		if e.Image != nil {
+			if u := firstURL(e.Image.URL, e.Image.ProxyURL); isGifURL(u) {
+				return u, false
+			}
+		}
+		if e.Thumbnail != nil {
+			if u := firstURL(e.Thumbnail.URL, e.Thumbnail.ProxyURL); isGifURL(u) {
+				return u, false
+			}
+		}
+		if e.Video != nil {
+			if u := firstURL(e.Video.URL, e.Video.ProxyURL); u != "" {
+				// A picker's "GIF" is a short mp4 loop (kind "gifv", or any clip
+				// from a GIF host). It reads as a GIF, so the phone loops it
+				// instead of handing it to the video player.
+				return u, !(kind == "gifv" || isGifHost(u))
+			}
+		}
+		if e.Image != nil {
+			if u := firstURL(e.Image.URL, e.Image.ProxyURL); u != "" {
+				return u, false
+			}
+		}
+	}
+	return "", false
+}
+
+// embedPoster is the still Discord already made for a linked video (the embed's
+// thumbnail), or "".
+func embedPoster(m *discordgo.Message) string {
+	for _, e := range m.Embeds {
+		if e != nil && e.Thumbnail != nil {
+			if u := firstURL(e.Thumbnail.URL, e.Thumbnail.ProxyURL); u != "" {
+				return u
+			}
+		}
+	}
+	return ""
+}
+
+// embedSourceURL is the link the embed came from, so the message can drop it: the
+// watch shows the picture, not a url nobody can read.
+func embedSourceURL(m *discordgo.Message) string {
+	for _, e := range m.Embeds {
+		if e != nil && e.URL != "" {
+			return e.URL
+		}
+	}
+	return ""
+}
+
+func firstURL(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+// isGifHost spots the GIF pickers: their clips loop, whatever the file says.
+func isGifHost(u string) bool {
+	h := ""
+	if i := strings.Index(u, "://"); i >= 0 {
+		h = u[i+3:]
+	} else {
+		h = u
+	}
+	if i := strings.IndexAny(h, "/?#"); i >= 0 {
+		h = h[:i]
+	}
+	h = strings.ToLower(strings.TrimPrefix(h, "www."))
+	for _, s := range []string{"tenor.com", "klipy.com", "giphy.com", "gfycat.com"} {
+		if h == s || strings.HasSuffix(h, "."+s) {
+			return true
+		}
+	}
+	return false
+}
+
+func isGifURL(u string) bool {
+	if u == "" {
+		return false
+	}
+	if i := strings.IndexAny(u, "?#"); i >= 0 {
+		u = u[:i]
+	}
+	return strings.HasSuffix(strings.ToLower(u), ".gif")
+}
+
+// videoPoster asks Discord's media proxy for a video attachment's first frame as
+// a JPEG — the same request Discord's own client makes for its video previews.
+func videoPoster(a *discordgo.MessageAttachment) string {
+	u := a.ProxyURL
+	if u == "" {
+		return ""
+	}
+	sep := "?"
+	if strings.Contains(u, "?") {
+		sep = "&"
+	}
+	return u + sep + "format=jpeg"
+}
+
+// audioAttachment returns the first sound attachment: a voice message (audio/ogg with
+// a duration) or a sound file. The phone plays it on the watch (step 86).
+func audioAttachment(m *discordgo.Message) *discordgo.MessageAttachment {
 	if m == nil {
 		return nil
 	}
@@ -1130,8 +1739,7 @@ func scalableImage(m *discordgo.Message) *discordgo.MessageAttachment {
 		if a == nil {
 			continue
 		}
-		switch a.ContentType {
-		case "image/jpeg", "image/png", "image/webp":
+		if strings.HasPrefix(a.ContentType, "audio/") || (a.ContentType == "" && a.DurationSeconds > 0) {
 			return a
 		}
 	}
@@ -1207,22 +1815,85 @@ func (b *Bridge) buildOutMsg(m *discordgo.Message) outMsg {
 
 	isMe := m.Author != nil && m.Author.ID == self
 
-	// Media: a scalable image attachment becomes real mediaContent (the watch
-	// requests bytes via DiscordService.downloadImage -> DownloadImageForWatch), and
-	// its URL is cached for that later fetch. A caption rides along as content; a
-	// caption-less image sends empty content so the watch just shows the picture.
-	// Every other media kind stays a text label ([Video]/[Voice]/[GIF]/[Sticker]/
-	// [Link]/filename), applied only when there's no text and no image.
-	content := m.Content
-	var mc *outMediaContent
-	if a := scalableImage(m); a != nil {
-		b.mu.Lock()
-		b.imageURL[m.ID] = attachmentURL(a)
-		b.mu.Unlock()
-		mc = &outMediaContent{Format: "IMAGE", MimeType: a.ContentType, MediaID: m.ID}
+	// Media: every picture and video attachment becomes real mediaContent, in the
+	// order they were attached (step 88): one is the message's media as it always
+	// was; two or more, the phone shows as an album (one bubble in the chat, paged
+	// through on the watch). A picture's bytes come through DiscordService.downloadImage
+	// -> DownloadImageForWatch, so its URL is cached here under its media id
+	// (pictures). A caption rides along as content; a caption-less message sends
+	// empty content so the watch just shows the pictures. Without pictures or videos,
+	// a voice message or a linked GIF / clip is the media (below). Every other kind
+	// stays a text label ([Sticker]/[Link]/filename), applied only when there's no
+	// text and no media.
+	content := b.resolveMentions(m, m.Content)
+	var mcs []*outMediaContent
+	picAs, picIDs := pictures(m)
+	picID := make(map[*discordgo.MessageAttachment]string, len(picAs))
+	for k, a := range picAs {
+		picID[a] = picIDs[k]
 	}
-	if content == "" && mc == nil {
+	b.mu.Lock()
+	for _, a := range m.Attachments {
+		if a == nil {
+			continue
+		}
+		if id, ok := picID[a]; ok {
+			b.imageURL[id] = attachmentURL(a)
+			mcs = append(mcs, &outMediaContent{Format: "IMAGE", MimeType: a.ContentType, MediaID: id})
+		} else if strings.HasPrefix(a.ContentType, "video/") {
+			// A video's media id IS its CDN url: the phone downloads the file by url
+			// for its own decoder, so there's no bridge round-trip to arrange (and the
+			// same phone-side path already handles a clip that arrived as a link).
+			// Discord signs these urls and they expire; a stale one simply fails to
+			// download and a thread reopen re-caches a fresh one, exactly as for images.
+			mcs = append(mcs, &outMediaContent{Format: "VIDEO", MimeType: a.ContentType, MediaID: attachmentURL(a),
+				PosterMediaID: videoPoster(a)})
+		}
+	}
+	b.mu.Unlock()
+	if len(mcs) == 0 {
+		if a := audioAttachment(m); a != nil {
+			// A voice message (or a sound file), played on the watch's speaker (step 86).
+			// Its media id is "<channel>/<message>": the phone fetches it through
+			// DownloadMediaToFile, which re-learns an expired link (the phone keeps a
+			// message's first JSON, so a link here would go stale after a day). Its label
+			// ("[Voice]", or a file's name) stays as the text, for the chat list and
+			// notifications; the phone shows the voice card instead of a bare label.
+			b.mu.Lock()
+			b.audioURL[m.ID] = attachmentURL(a)
+			b.mu.Unlock()
+			mime := a.ContentType
+			if mime == "" {
+				mime = "audio/ogg"
+			}
+			mcs = append(mcs, &outMediaContent{Format: "AUDIO", MimeType: mime, MediaID: m.ChannelID + "/" + m.ID})
+			if content == "" {
+				content = mediaLabelOf(m)
+			}
+		} else if u, isVideo := embedMedia(m); u != "" {
+			// A linked GIF / clip: the url is the media id, and the phone fetches it.
+			if isVideo {
+				mcs = append(mcs, &outMediaContent{Format: "VIDEO", MimeType: "video/mp4", MediaID: u,
+					PosterMediaID: embedPoster(m)})
+			} else {
+				mcs = append(mcs, &outMediaContent{Format: "IMAGE", MimeType: "image/gif", MediaID: u})
+			}
+			if src := embedSourceURL(m); src != "" {
+				content = strings.TrimSpace(strings.Replace(content, src, "", 1))
+			}
+		}
+	}
+	if content == "" && len(mcs) == 0 {
 		content = mediaLabelOf(m)
+	}
+	// The text and the first medium share the first entry (as a single one always
+	// has); each further picture or video is an entry of its own.
+	infos := []outMsgInfo{{MessageContent: outContent{Content: content}}}
+	if len(mcs) > 0 {
+		infos[0].MediaContent = mcs[0]
+		for _, mc := range mcs[1:] {
+			infos = append(infos, outMsgInfo{MediaContent: mc})
+		}
 	}
 
 	status := "INCOMING_COMPLETE"
@@ -1249,7 +1920,7 @@ func (b *Bridge) buildOutMsg(m *discordgo.Message) outMsg {
 			ID:        outID{Number: senderNum},
 		},
 		MessageStatus: outStatus{Status: status},
-		MessageInfo:   []outMsgInfo{{MessageContent: outContent{Content: content}, MediaContent: mc}},
+		MessageInfo:   infos,
 		IsMe:          isMe,
 		FromMe:        isMe,
 	}
@@ -1312,6 +1983,49 @@ func (b *Bridge) buildOutMsg(m *discordgo.Message) outMsg {
 func snowflake(id string) uint64 {
 	n, _ := strconv.ParseUint(id, 10, 64)
 	return n
+}
+
+// resolveMentions rewrites Discord's raw mention tokens in message text into the
+// readable names its own client shows: "<@id>"/"<@!id>" -> "@DisplayName",
+// "<#channelID>" -> "#channel-name", "<@&roleID>" -> "@role-name". Without this the
+// watch shows the raw "<@1385699117723947031>" token (a bare snowflake) instead of
+// "@Sweet Gherkins", since the watch renders content verbatim. The names come from
+// data already on the message: m.Mentions (full user objects) and m.MentionRoles,
+// plus the bridge's channelName map. Unknown ids are left as-is (rare; a name we
+// never learned), which is still no worse than today.
+func (b *Bridge) resolveMentions(m *discordgo.Message, content string) string {
+	if content == "" || !strings.Contains(content, "<") {
+		return content
+	}
+	repl := make([]string, 0, 16)
+	// User mentions: both "<@id>" and the legacy nickname form "<@!id>" map to the
+	// same user. m.Mentions carries the resolved user object for each.
+	for _, u := range m.Mentions {
+		if u == nil || u.ID == "" {
+			continue
+		}
+		name := "@" + bestName(u)
+		repl = append(repl, "<@"+u.ID+">", name, "<@!"+u.ID+">", name)
+	}
+	// Channel mentions: name from the bridge's channelID->name cache.
+	b.mu.Lock()
+	for id, name := range b.channelName {
+		tok := "<#" + id + ">"
+		if name != "" && strings.Contains(content, tok) {
+			repl = append(repl, tok, "#"+name)
+		}
+	}
+	b.mu.Unlock()
+	// NOTE: role mentions ("<@&roleID>") are intentionally left unresolved for now.
+	// Resolving them needs the guild role list, and this fork's State/role API is
+	// unverified here — a wrong call would fail the whole gomobile build. User and
+	// channel mentions (the common cases, and the reported bug) are covered above.
+	// Add roles later once State.Role's signature is confirmed against the vendored
+	// discordgo, if role mentions turn out to leak in practice.
+	if len(repl) == 0 {
+		return content
+	}
+	return strings.NewReplacer(repl...).Replace(content)
 }
 
 func bestName(u *discordgo.User) string {

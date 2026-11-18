@@ -20,10 +20,18 @@ package telegrambridge
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	crand "crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	"image/png"
 	"math/rand"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,13 +39,19 @@ import (
 
 	// Reuse the EXACT watch image encoder Google/WhatsApp use (scale + 4bpp
 	// palettize); we only do the Telegram-specific download, then hand raw bytes
-	// to mirrorbridge.EncodeImageForWatch so images render identically.
-	"fi.mirrormsg/mirrorbridge"
+	// to watchimage.EncodeImageForWatch so images render identically.
+	"fi.mirrormsg/watchimage"
+	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/tg"
+	_ "golang.org/x/image/webp" // sticker pictures are WebP
 )
+
+// MirrorMsg's Telegram app credentials (from my.telegram.org). App-identifier
+// only — NOT account access; login still requires phone + code + 2FA. Do not
+// publish source publicly with these embedded.
 
 // peerRef is the cached addressing for one conversation. Telegram's getHistory
 // needs an InputPeer built from the peer id + access_hash, and the access_hash
@@ -82,12 +96,18 @@ type Bridge struct {
 	runErr error
 	sink   LiveSink // live-update callback into the host (guarded by mu)
 
-	photos     map[string]photoRef // msgID -> photo download ref (guarded by mu)
+	photos     map[string]photoRef // media base ("c<chan>-<msg>") -> photo download ref (guarded by mu)
 	photoOrder []string            // FIFO eviction order for the photo cache
+
+	docs     map[string]docRef // media base ("c<chan>-<msg>") -> video/audio document ref (guarded by mu)
+	docOrder []string          // FIFO eviction order for the document cache
+
+	avatars map[string]int64 // conversationID -> its photo's id, learnt from lists and live updates (guarded by mu)
 }
 
-// photoRef is enough to re-download a message's photo later, keyed by its
-// message id — mirrors the WhatsApp bridge's stored image handle.
+// photoRef is enough to re-download a message's photo later. Keyed by the
+// conversation-qualified media base: channel message ids are per-channel, so a bare
+// message id could hand one channel's picture to another.
 type photoRef struct {
 	id         int64
 	accessHash int64
@@ -96,6 +116,26 @@ type photoRef struct {
 }
 
 const maxStoredPhotos = 300
+
+// docRef is enough to re-download a message's video, audio or sticker document (and
+// a video's poster thumbnail) later. Keyed by a conversation-qualified media base,
+// because channel message ids are per-channel and would collide across channels.
+type docRef struct {
+	id         int64
+	accessHash int64
+	fileRef    []byte
+	size       int64
+	mime       string
+	thumbType  string // largest downloadable thumb (poster); "" = none
+}
+
+const (
+	maxStoredDocs         = 300
+	maxMediaBytes         = 64 << 20
+	mediaDownloadTimeout  = 3 * time.Minute
+	mediaThreads          = 4
+	avatarDownloadTimeout = 30 * time.Second
+)
 
 // LiveSink is implemented on the host (Kotlin) side and set via SetLiveSink; the
 // bridge calls it to surface live events (new messages, diagnostics). Bound by
@@ -152,6 +192,8 @@ func (b *Bridge) onUpdateMessage(mc tg.MessageClass, e tg.Entities) {
 	if convoID == "" {
 		return
 	}
+	// Learn photos before the message goes out, so its notification can name one.
+	b.learnAvatarsFromEntities(e)
 	userByID := make(map[int64]*tg.User)
 	for id, u := range e.Users {
 		userByID[id] = u
@@ -164,9 +206,11 @@ func (b *Bridge) onUpdateMessage(mc tg.MessageClass, e tg.Entities) {
 }
 
 // NewTelegramBridge starts the client run loop against the session file at
-// sessionPath (e.g. <filesDir>/tg_session.json) and returns immediately. Bound by
-// gomobile as Telegrambridge.newTelegramBridge.
-func NewTelegramBridge(sessionPath string) *Bridge {
+// sessionPath (e.g. <filesDir>/tg_session.json) and returns immediately. The session
+// is the whole login, so it's sealed with sessionKeyB64 (32 bytes, base64, kept in the
+// app's Keystore vault); an empty key keeps it plain. Bound by gomobile as
+// Telegrambridge.newTelegramBridge.
+func NewTelegramBridge(sessionPath string, sessionKeyB64 string) *Bridge {
 	b := &Bridge{
 		cmds:           make(chan func(context.Context), 8),
 		ready:          make(chan struct{}),
@@ -175,24 +219,96 @@ func NewTelegramBridge(sessionPath string) *Bridge {
 		folderPeers:    make(map[int][]tg.InputPeerClass),
 		folderedConvos: make(map[string]bool),
 		photos:         make(map[string]photoRef),
+		docs:           make(map[string]docRef),
+		avatars:        make(map[string]int64),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	b.cancel = cancel
-	go b.run(ctx, sessionPath)
+	go b.run(ctx, newSessionStore(sessionPath, sessionKeyB64))
 	return b
 }
 
-func (b *Bridge) run(ctx context.Context, sessionPath string) {
-	defer close(b.done)
-	// apiID/apiHash come from credentials.local.go (gitignored). On a fresh
-	// checkout that file is absent, so bail out with a clear message rather than
-	// attempting to connect with empty credentials. Surfaces via LastError().
-	if apiID == 0 || apiHash == "" {
-		b.mu.Lock()
-		b.runErr = errors.New("Telegram API credentials not found — copy credentials.local.go.example to credentials.local.go and fill in your own values from https://my.telegram.org")
-		b.mu.Unlock()
-		return
+// ---- Sealed session file ---------------------------------------------------------
+//
+// sealedSession stores gotd's session (the auth key, i.e. the login) as
+// "MMS1" + nonce + AES-256-GCM ciphertext. A plain session left by an older build is
+// read as-is and sealed straight away, so nobody has to log in again. One that won't
+// open (key lost) reads as "no session": Telegram then asks for a fresh login.
+
+var sealedMagic = []byte("MMS1")
+
+type sealedSession struct {
+	path string
+	aead cipher.AEAD
+	mu   sync.Mutex
+}
+
+func newSessionStore(path, keyB64 string) telegram.SessionStorage {
+	key, err := base64.StdEncoding.DecodeString(keyB64)
+	if err != nil || len(key) != 32 {
+		return &telegram.FileSessionStorage{Path: path}
 	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return &telegram.FileSessionStorage{Path: path}
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return &telegram.FileSessionStorage{Path: path}
+	}
+	return &sealedSession{path: path, aead: aead}
+}
+
+func (s *sealedSession) LoadSession(_ context.Context) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := os.ReadFile(s.path)
+	if os.IsNotExist(err) {
+		return nil, session.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.HasPrefix(data, sealedMagic) {
+		if err := s.write(data); err != nil {
+			return nil, err
+		}
+		return data, nil
+	}
+	ns := s.aead.NonceSize()
+	body := data[len(sealedMagic):]
+	if len(body) < ns {
+		return nil, session.ErrNotFound
+	}
+	plain, err := s.aead.Open(nil, body[:ns], body[ns:], sealedMagic)
+	if err != nil {
+		return nil, session.ErrNotFound
+	}
+	return plain, nil
+}
+
+func (s *sealedSession) StoreSession(_ context.Context, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.write(data)
+}
+
+// write seals data and replaces the file atomically. Caller holds mu.
+func (s *sealedSession) write(data []byte) error {
+	nonce := make([]byte, s.aead.NonceSize())
+	if _, err := crand.Read(nonce); err != nil {
+		return err
+	}
+	out := append(append(append([]byte{}, sealedMagic...), nonce...), s.aead.Seal(nil, nonce, data, sealedMagic)...)
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
+}
+
+func (b *Bridge) run(ctx context.Context, store telegram.SessionStorage) {
+	defer close(b.done)
 	// Providing an UpdateHandler enables update delivery (gotd disables updates by
 	// default). The dispatcher routes typed updates to our handlers.
 	disp := tg.NewUpdateDispatcher()
@@ -216,7 +332,7 @@ func (b *Bridge) run(ctx context.Context, sessionPath string) {
 		return nil
 	})
 	client := telegram.NewClient(apiID, apiHash, telegram.Options{
-		SessionStorage: &telegram.FileSessionStorage{Path: sessionPath},
+		SessionStorage: store,
 		UpdateHandler:  disp,
 	})
 	b.client = client
@@ -357,6 +473,7 @@ type outConvo struct {
 	Unread         bool             `json:"unread"`
 	LatestMessage  outLatest        `json:"latestMessage"`
 	Participants   []outParticipant `json:"participants"`
+	AvatarID       string           `json:"avatarID,omitempty"` // "<convoID>|<photo id>"; absent = no photo
 }
 type outConvos struct {
 	Conversations []outConvo `json:"conversations"`
@@ -403,6 +520,7 @@ func (b *Bridge) dialogsToConvos(dialogs []tg.DialogClass, msgs []tg.MessageClas
 		}
 		var convoID, name, number string
 		var pr peerRef
+		var photoID int64
 		switch p := d.Peer.(type) {
 		case *tg.PeerUser:
 			u := userByID[p.UserID]
@@ -414,11 +532,13 @@ func (b *Bridge) dialogsToConvos(dialogs []tg.DialogClass, msgs []tg.MessageClas
 			name = strings.TrimSpace(u.FirstName + " " + u.LastName)
 			number = fmt.Sprintf("%d", p.UserID)
 			pr = peerRef{kind: "user", id: p.UserID, hash: hash}
+			photoID = userPhotoID(u)
 		case *tg.PeerChat:
 			convoID = fmt.Sprintf("tg:chat:%d", p.ChatID)
 			number = fmt.Sprintf("%d", p.ChatID)
 			if c := chatByID[p.ChatID]; c != nil {
 				name = c.Title
+				photoID = chatPhotoID(c.Photo)
 			}
 			pr = peerRef{kind: "chat", id: p.ChatID, hash: 0}
 		case *tg.PeerChannel:
@@ -428,6 +548,7 @@ func (b *Bridge) dialogsToConvos(dialogs []tg.DialogClass, msgs []tg.MessageClas
 			if c := channelByID[p.ChannelID]; c != nil {
 				hash, _ = c.GetAccessHash()
 				name = c.Title
+				photoID = chatPhotoID(c.Photo)
 			}
 			pr = peerRef{kind: "channel", id: p.ChannelID, hash: hash}
 		default:
@@ -460,9 +581,121 @@ func (b *Bridge) dialogsToConvos(dialogs []tg.DialogClass, msgs []tg.MessageClas
 			Unread:         d.UnreadCount > 0,
 			LatestMessage:  outLatest{DisplayContent: preview},
 			Participants:   []outParticipant{{IsMe: false, ID: outID{Number: number}}},
+			AvatarID:       b.learnAvatar(convoID, photoID),
 		})
 	}
 	return out
+}
+
+// ---- Contact photos ------------------------------------------------------------
+//
+// A chat's photo is named "<convoID>|<photo id>": the other person's for a 1:1 chat,
+// the group's or channel's own for the rest. The id changes when the photo does.
+// Chat rows carry it as avatarID; notifications ask AvatarID, which answers from what
+// lists and live updates taught it, with no network call.
+
+func userPhotoID(u *tg.User) int64 {
+	if p, ok := u.GetPhoto(); ok {
+		if up, ok := p.(*tg.UserProfilePhoto); ok {
+			return up.PhotoID
+		}
+	}
+	return 0
+}
+
+func chatPhotoID(p tg.ChatPhotoClass) int64 {
+	if cp, ok := p.(*tg.ChatPhoto); ok {
+		return cp.PhotoID
+	}
+	return 0
+}
+
+// learnAvatar records a chat's current photo (0 = none) and returns its avatar id.
+func (b *Bridge) learnAvatar(convoID string, photoID int64) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if photoID == 0 {
+		delete(b.avatars, convoID)
+		return ""
+	}
+	b.avatars[convoID] = photoID
+	return fmt.Sprintf("%s|%d", convoID, photoID)
+}
+
+// learnAvatarsFromEntities records the photos of the users, groups and channels a live
+// update carries. "Min" entities are partial and may leave the photo out, so they are
+// skipped rather than allowed to erase a known one.
+func (b *Bridge) learnAvatarsFromEntities(e tg.Entities) {
+	for id, u := range e.Users {
+		if u != nil && !u.Min {
+			b.learnAvatar(fmt.Sprintf("tg:user:%d", id), userPhotoID(u))
+		}
+	}
+	for id, c := range e.Chats {
+		if c != nil {
+			b.learnAvatar(fmt.Sprintf("tg:chat:%d", id), chatPhotoID(c.Photo))
+		}
+	}
+	for id, c := range e.Channels {
+		if c != nil && !c.Min {
+			b.learnAvatar(fmt.Sprintf("tg:channel:%d", id), chatPhotoID(c.Photo))
+		}
+	}
+}
+
+// AvatarID names a chat's photo for a notification, from what the bridge has already
+// seen; "" = no photo known. Never touches the network.
+func (b *Bridge) AvatarID(conversationID string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if id, ok := b.avatars[conversationID]; ok && id != 0 {
+		return fmt.Sprintf("%s|%d", conversationID, id)
+	}
+	return ""
+}
+
+// AvatarBytes downloads the small (160 px) JPEG an avatar id names. It returns an error
+// whenever the photo can't be had right now, so the phone tries again instead of
+// remembering "no photo". The download runs off the pump.
+func (b *Bridge) AvatarBytes(avatarID string) ([]byte, error) {
+	i := strings.LastIndex(avatarID, "|")
+	if i <= 0 {
+		return nil, errors.New("bad avatar id")
+	}
+	convoID := avatarID[:i]
+	photoID, err := strconv.ParseInt(avatarID[i+1:], 10, 64)
+	if err != nil || photoID == 0 {
+		return nil, errors.New("bad avatar id")
+	}
+	var peer tg.InputPeerClass
+	if r := b.call(10*time.Second, func(ctx context.Context) string {
+		p, ok := b.inputPeerFor(convoID)
+		if !ok {
+			return "unknown conversation (list first)"
+		}
+		peer = p
+		return ""
+	}); r != "" {
+		return nil, errors.New("avatar: " + r)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), avatarDownloadTimeout)
+	defer cancel()
+	go func() {
+		select {
+		case <-b.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	loc := &tg.InputPeerPhotoFileLocation{Peer: peer, PhotoID: photoID}
+	var buf bytes.Buffer
+	if _, err := downloader.NewDownloader().Download(b.client.API(), loc).Stream(ctx, &buf); err != nil {
+		return nil, errors.New("avatar download: " + err.Error())
+	}
+	if buf.Len() == 0 {
+		return nil, errors.New("avatar: empty file")
+	}
+	return buf.Bytes(), nil
 }
 
 // ListConversations returns the most-recent `limit` dialogs (DMs, groups, and
@@ -544,9 +777,11 @@ type outContent struct {
 	Content string `json:"content"`
 }
 type outMediaContent struct {
-	Format   string `json:"format"`
-	MimeType string `json:"mimeType"`
-	MediaID  string `json:"mediaID"`
+	Format        string `json:"format"`
+	MimeType      string `json:"mimeType"`
+	MediaID       string `json:"mediaID"`
+	GifLike       *bool  `json:"gifLike,omitempty"`       // video parts only
+	PosterMediaID string `json:"posterMediaID,omitempty"` // video poster, via DownloadImageForWatch
 }
 type outMsgInfo struct {
 	MessageContent outContent       `json:"messageContent"`
@@ -569,10 +804,12 @@ type outMsg struct {
 	IsMe              bool           `json:"isMe"`
 	FromMe            bool           `json:"fromMe"`
 	ReplyTo           *outReplyTo    `json:"replyTo,omitempty"`
+	AlbumID           string         `json:"albumID,omitempty"` // Telegram grouped_id, on every item of an album
 	Reactions         *[]outReaction `json:"reactions,omitempty"`
 }
 type outMsgs struct {
 	Messages []outMsg `json:"messages"`
+	Cursor   string   `json:"cursor,omitempty"` // oldest id in batch; "" = true top
 	TgError  string   `json:"tgError,omitempty"`
 }
 
@@ -681,34 +918,44 @@ func largestPhotoSizeType(sizes []tg.PhotoSizeClass) string {
 	return best
 }
 
-// rememberPhoto caches a message photo's download ref by message id (FIFO-capped),
+// rememberPhoto caches a message photo's download ref by media base (FIFO-capped),
 // so DownloadImageForWatch can fetch it later. Guarded by mu since it is called
-// from both the pump (FetchMessages) and the update-dispatcher goroutines.
-func (b *Bridge) rememberPhoto(msgID string, mp *tg.MessageMediaPhoto) {
+// from both the pump (FetchMessages) and the update-dispatcher goroutines. Reports
+// false when the photo has no downloadable size.
+func (b *Bridge) rememberPhoto(base string, mp *tg.MessageMediaPhoto) (photoRef, bool) {
 	photo, ok := mp.Photo.(*tg.Photo)
 	if !ok {
-		return
+		return photoRef{}, false
 	}
 	typ := largestPhotoSizeType(photo.Sizes)
 	if typ == "" {
-		return
+		return photoRef{}, false
+	}
+	pr := photoRef{
+		id:         photo.ID,
+		accessHash: photo.AccessHash,
+		fileRef:    photo.FileReference,
+		thumbType:  typ,
 	}
 	b.mu.Lock()
-	if _, exists := b.photos[msgID]; !exists {
-		b.photoOrder = append(b.photoOrder, msgID)
+	if _, exists := b.photos[base]; !exists {
+		b.photoOrder = append(b.photoOrder, base)
 		for len(b.photoOrder) > maxStoredPhotos {
 			old := b.photoOrder[0]
 			b.photoOrder = b.photoOrder[1:]
 			delete(b.photos, old)
 		}
 	}
-	b.photos[msgID] = photoRef{
-		id:         photo.ID,
-		accessHash: photo.AccessHash,
-		fileRef:    photo.FileReference,
-		thumbType:  typ,
-	}
+	b.photos[base] = pr
 	b.mu.Unlock()
+	return pr, true
+}
+
+func (b *Bridge) cachedPhoto(base string) (photoRef, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	pr, ok := b.photos[base]
+	return pr, ok
 }
 
 // buildOutMsg formats one Telegram message into the watch-shaped outMsg, shared by
@@ -716,22 +963,45 @@ func (b *Bridge) rememberPhoto(msgID string, mp *tg.MessageMediaPhoto) {
 // when there's no text, and a reply-to id when the message quotes another.
 func (b *Bridge) buildOutMsg(conversationID string, m *tg.Message, userByID map[int64]*tg.User) outMsg {
 	// Photo -> a requestable image (mediaContent); the watch fetches the bytes via
-	// DownloadImageForWatch keyed by the message id. Other media keeps its text
-	// label. rememberPhoto caches the download ref for that later fetch.
+	// DownloadImageForWatch keyed by the chat-scoped "tgi-" id. Other media keeps its
+	// text label. rememberPhoto caches the download ref for that later fetch.
 	msgID := fmt.Sprintf("%d", m.ID)
 	var mc *outMediaContent
 	if media, ok := m.GetMedia(); ok {
 		if mp, ok := media.(*tg.MessageMediaPhoto); ok {
-			if _, ok := mp.Photo.(*tg.Photo); ok {
-				b.rememberPhoto(msgID, mp)
-				mc = &outMediaContent{Format: "IMAGE", MimeType: "image/jpeg", MediaID: msgID}
+			if base := mediaBase(conversationID, msgID); base != "" {
+				if _, ok := b.rememberPhoto(base, mp); ok {
+					mc = &outMediaContent{Format: "IMAGE", MimeType: "image/jpeg", MediaID: photoPrefix + base}
+				}
 			}
 		}
 	}
+	if mc == nil {
+		if d, gifLike, ok := videoDoc(m); ok {
+			mc = b.videoContent(conversationID, msgID, d, gifLike)
+		} else if d, ok := audioDoc(m); ok {
+			mc = b.audioContent(conversationID, msgID, d)
+		} else if d, ok := stickerImageDoc(m); ok {
+			mc = b.stickerContent(conversationID, msgID, d)
+		}
+	}
 	content := m.Message
-	if content == "" && mc == nil {
-		if lbl := mediaLabel(m); lbl != "" {
-			content = lbl
+	if content == "" {
+		switch {
+		case mc == nil:
+			content = mediaLabel(m)
+		case isStickerMsg(m):
+			// A sticker shown as a picture or a looping clip carries no text, like a photo.
+		case mc.Format == "VIDEO":
+			// Keep the type label ([Video] / [GIF] / [Video message]) as the row text.
+			if content = mediaLabel(m); content == "" || content == "[File]" {
+				content = "[Video]"
+			}
+		case mc.Format == "AUDIO":
+			// Keep the type label ([Voice] / [Audio]) as the row text.
+			if content = mediaLabel(m); content == "" || content == "[File]" {
+				content = "[Audio]"
+			}
 		}
 	}
 	isMe := m.Out
@@ -777,6 +1047,12 @@ func (b *Bridge) buildOutMsg(conversationID string, m *tg.Message, userByID map[
 		MessageInfo:   []outMsgInfo{{MessageContent: outContent{Content: content}, MediaContent: mc}},
 		IsMe:          isMe,
 		FromMe:        isMe,
+	}
+	// Album: the messages of a media group share grouped_id. Only pictures and videos
+	// are album items on the phone, so files and music sent as a group (Telegram
+	// groups those too) stay separate rows.
+	if gid, ok := m.GetGroupedID(); ok && gid != 0 && mc != nil && (mc.Format == "IMAGE" || mc.Format == "VIDEO") {
+		om.AlbumID = fmt.Sprintf("%d", gid)
 	}
 	if rh, ok := m.GetReplyTo(); ok {
 		if rhm, ok := rh.(*tg.MessageReplyHeader); ok {
@@ -910,42 +1186,629 @@ func (b *Bridge) SendReaction(conversationID string, msgID int, emoji string) st
 	})
 }
 
-// DownloadImageForWatch fetches the cached photo for msgID, then runs it through
-// the SHARED mirrorbridge encoder (scale + 4bpp palettize) so Telegram images
-// render identically to Google/WhatsApp. Returns {"w","h","pixels","fmt","palette"}
-// or an {"error":...} object the phone handles gracefully. maxBytes>0 is the
-// enhanced-view heap budget; maxBytes==0 is the small chat-preview box.
-func (b *Bridge) DownloadImageForWatch(msgID string, maxW, maxH, maxBytes, quality int) string {
-	b.mu.Lock()
-	pr, ok := b.photos[msgID]
-	b.mu.Unlock()
-	if !ok {
-		return errJSON("no stored image for " + msgID)
+// MarkThreadRead marks a conversation read up through msgID. Telegram splits this
+// by peer type: channels/supergroups use channels.readHistory (needs an
+// InputChannel), while user DMs and basic groups use messages.readHistory (an
+// InputPeer). Read state is a per-dialog high-water mark (MaxID = read up to and
+// including that id), so marking the newest message clears the dialog's unread
+// count. msgID arrives as a string (the interface shape); Telegram ids are ints,
+// so we parse and no-op safely on a non-numeric id.
+func (b *Bridge) MarkThreadRead(conversationID string, msgID string) string {
+	maxID, perr := strconv.Atoi(msgID)
+	if perr != nil || maxID <= 0 {
+		return errJSON("bad message id " + msgID)
 	}
+	return b.call(30*time.Second, func(ctx context.Context) string {
+		pr, ok := b.peers[conversationID]
+		if !ok {
+			return errJSON("unknown conversation (list first)")
+		}
+		if pr.kind == "channel" {
+			// channels/supergroups: channels.readHistory with an InputChannel.
+			_, err := b.client.API().ChannelsReadHistory(ctx, &tg.ChannelsReadHistoryRequest{
+				Channel: &tg.InputChannel{ChannelID: pr.id, AccessHash: pr.hash},
+				MaxID:   maxID,
+			})
+			if err != nil {
+				return errJSON("channelsReadHistory: " + err.Error())
+			}
+			return okID(maxID)
+		}
+		// user DMs and basic groups: messages.readHistory with an InputPeer.
+		peer, pok := b.inputPeerFor(conversationID)
+		if !pok {
+			return errJSON("unknown conversation (list first)")
+		}
+		_, err := b.client.API().MessagesReadHistory(ctx, &tg.MessagesReadHistoryRequest{
+			Peer:  peer,
+			MaxID: maxID,
+		})
+		if err != nil {
+			return errJSON("messagesReadHistory: " + err.Error())
+		}
+		return okID(maxID)
+	})
+}
+
+// DownloadImageForWatch fetches a photo ("tgi-") or a video poster ("tgp-"), then
+// runs it through the SHARED watchimage encoder (scale + 4bpp palettize) so Telegram
+// images render identically to Google/WhatsApp. Returns {"w","h","pixels","fmt",
+// "palette"} or an {"error":...} object the phone handles gracefully. maxBytes>0 is
+// the enhanced-view heap budget; maxBytes==0 is the small chat-preview box. A bare
+// message id (stored before ids were chat-scoped) is refused rather than guessed:
+// it cannot say which chat it belongs to.
+func (b *Bridge) DownloadImageForWatch(mediaID string, maxW, maxH, maxBytes, quality int) string {
+	switch {
+	case strings.HasPrefix(mediaID, photoPrefix):
+		return b.encodeForWatch(b.photoLocation(strings.TrimPrefix(mediaID, photoPrefix)), false, maxW, maxH, maxBytes, quality)
+	case strings.HasPrefix(mediaID, posterPrefix):
+		return b.encodeForWatch(b.posterLocation(strings.TrimPrefix(mediaID, posterPrefix)), false, maxW, maxH, maxBytes, quality)
+	case strings.HasPrefix(mediaID, stickerPrefix):
+		return b.encodeForWatch(b.stickerLocation(strings.TrimPrefix(mediaID, stickerPrefix)), true, maxW, maxH, maxBytes, quality)
+	}
+	return errJSON("unscoped image id " + mediaID)
+}
+
+// fileLocator yields the file location for one image, from the cache or (fresh, or
+// on a cache miss) by re-fetching its message. Pump goroutine only.
+type fileLocator func(ctx context.Context, fresh bool) (tg.InputFileLocationClass, string)
+
+// encodeForWatch downloads one small image on the pump and encodes it for the watch.
+// A failed download retries once with a freshly resolved location, since Telegram
+// file references expire. toPNG first re-encodes the image as PNG (stickers are WebP,
+// which the watch encoder doesn't read).
+func (b *Bridge) encodeForWatch(locate fileLocator, toPNG bool, maxW, maxH, maxBytes, quality int) string {
 	return b.call(60*time.Second, func(ctx context.Context) string {
-		loc := &tg.InputPhotoFileLocation{
+		var lastErr string
+		for attempt := 0; attempt < 2; attempt++ {
+			loc, reason := locate(ctx, attempt > 0)
+			if reason != "" {
+				return errJSON(reason)
+			}
+			var buf bytes.Buffer
+			if _, err := downloader.NewDownloader().Download(b.client.API(), loc).Stream(ctx, &buf); err != nil {
+				lastErr = err.Error()
+				continue
+			}
+			raw := buf.Bytes()
+			if toPNG {
+				var err error
+				if raw, err = reencodePNG(raw); err != nil {
+					return errJSON("decode: " + err.Error())
+				}
+			}
+			out, err := watchimage.EncodeImageForWatch(raw, maxW, maxH, maxBytes, quality)
+			if err != nil {
+				return errJSON("encode: " + err.Error())
+			}
+			return out
+		}
+		return errJSON("download: " + lastErr)
+	})
+}
+
+// reencodePNG decodes a WebP, PNG or JPEG image and writes it back out as PNG.
+func reencodePNG(raw []byte) ([]byte, error) {
+	img, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	if err := png.Encode(&out, img); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+// stickerLocation names a sticker's picture: the whole file for a still sticker, the
+// built-in preview for an animated (.tgs) one.
+func (b *Bridge) stickerLocation(base string) fileLocator {
+	return func(ctx context.Context, fresh bool) (tg.InputFileLocationClass, string) {
+		ref, ok := b.cachedDoc(base)
+		if !ok || fresh {
+			var reason string
+			if ref, reason = b.resolveDoc(ctx, base); reason != "" {
+				return nil, "sticker: " + reason
+			}
+		}
+		loc := &tg.InputDocumentFileLocation{ID: ref.id, AccessHash: ref.accessHash, FileReference: ref.fileRef}
+		if !strings.HasPrefix(ref.mime, "image/") {
+			if ref.thumbType == "" {
+				return nil, "sticker: no preview"
+			}
+			loc.ThumbSize = ref.thumbType
+		}
+		return loc, ""
+	}
+}
+
+func (b *Bridge) photoLocation(base string) fileLocator {
+	return func(ctx context.Context, fresh bool) (tg.InputFileLocationClass, string) {
+		pr, ok := b.cachedPhoto(base)
+		if !ok || fresh {
+			var reason string
+			if pr, reason = b.resolvePhoto(ctx, base); reason != "" {
+				return nil, "photo: " + reason
+			}
+		}
+		return &tg.InputPhotoFileLocation{
 			ID:            pr.id,
 			AccessHash:    pr.accessHash,
 			FileReference: pr.fileRef,
 			ThumbSize:     pr.thumbType,
-		}
-		var buf bytes.Buffer
-		if _, err := downloader.NewDownloader().Download(b.client.API(), loc).Stream(ctx, &buf); err != nil {
-			return errJSON("download: " + err.Error())
-		}
-		out, err := mirrorbridge.EncodeImageForWatch(buf.Bytes(), maxW, maxH, maxBytes, quality)
-		if err != nil {
-			return errJSON("encode: " + err.Error())
-		}
-		return out
-	})
+		}, ""
+	}
 }
 
-func (b *Bridge) FetchMessages(conversationID string, limit int) string {
-	// The watch only renders ~25 messages per chat, so never fetch more (also
-	// keeps getHistory load — and FLOOD_WAIT risk — down).
-	if limit <= 0 || limit > 25 {
+func (b *Bridge) posterLocation(base string) fileLocator {
+	return func(ctx context.Context, fresh bool) (tg.InputFileLocationClass, string) {
+		ref, ok := b.cachedDoc(base)
+		if !ok || fresh {
+			var reason string
+			if ref, reason = b.resolveDoc(ctx, base); reason != "" {
+				return nil, "poster: " + reason
+			}
+		}
+		if ref.thumbType == "" {
+			return nil, "poster: no thumbnail"
+		}
+		return &tg.InputDocumentFileLocation{
+			ID:            ref.id,
+			AccessHash:    ref.accessHash,
+			FileReference: ref.fileRef,
+			ThumbSize:     ref.thumbType,
+		}, ""
+	}
+}
+
+// ---- Media ids -----------------------------------------------------------------
+//
+// Every media id is "<prefix><base>", where <base> is conversation-qualified and
+// filename-safe ("c2102748773-4521" = channel 2102748773, message 4521). Channel
+// message ids are per-channel, so the chat must be part of the id. The base also
+// lets the bridge re-resolve the message itself: that survives an app restart
+// (history loaded from disk) and renews expired file references.
+//
+//	tgi-<base>  photo         -> DownloadImageForWatch
+//	tgp-<base>  video poster  -> DownloadImageForWatch
+//	tgv-<base>  video file    -> DownloadMediaToFile
+//	tga-<base>  audio file    -> DownloadMediaToFile (voice notes and audio files)
+//	tgk-<base>  sticker       -> DownloadImageForWatch (still, or an animated one's preview)
+
+const (
+	photoPrefix   = "tgi-"
+	posterPrefix  = "tgp-"
+	videoPrefix   = "tgv-"
+	audioPrefix   = "tga-"
+	stickerPrefix = "tgk-"
+)
+
+// videoDoc returns m's document when it is a playable video (regular, round, GIF
+// animation, a video sent as a file, or a video sticker), plus whether it is a
+// GIF-style clip. Video stickers (short WebM clips) loop like GIFs; other stickers
+// are not videos.
+func videoDoc(m *tg.Message) (*tg.Document, bool, bool) {
+	media, ok := m.GetMedia()
+	if !ok {
+		return nil, false, false
+	}
+	md, ok := media.(*tg.MessageMediaDocument)
+	if !ok {
+		return nil, false, false
+	}
+	d, ok := md.Document.(*tg.Document)
+	if !ok {
+		return nil, false, false
+	}
+	var isVideo, isSticker, isAnim bool
+	for _, a := range d.Attributes {
+		switch a.(type) {
+		case *tg.DocumentAttributeVideo:
+			isVideo = true
+		case *tg.DocumentAttributeSticker:
+			isSticker = true
+		case *tg.DocumentAttributeAnimated:
+			isAnim = true
+		}
+	}
+	isVideo = isVideo || strings.HasPrefix(d.MimeType, "video/")
+	if isSticker {
+		if isVideo {
+			return d, true, true
+		}
+		return nil, false, false
+	}
+	if !isVideo {
+		return nil, false, false
+	}
+	return d, isAnim, true
+}
+
+// stickerDocOf returns m's document when it is a sticker of any kind.
+func stickerDocOf(m *tg.Message) (*tg.Document, bool) {
+	media, ok := m.GetMedia()
+	if !ok {
+		return nil, false
+	}
+	md, ok := media.(*tg.MessageMediaDocument)
+	if !ok {
+		return nil, false
+	}
+	d, ok := md.Document.(*tg.Document)
+	if !ok {
+		return nil, false
+	}
+	for _, a := range d.Attributes {
+		if _, ok := a.(*tg.DocumentAttributeSticker); ok {
+			return d, true
+		}
+	}
+	return nil, false
+}
+
+func isStickerMsg(m *tg.Message) bool {
+	_, ok := stickerDocOf(m)
+	return ok
+}
+
+// stickerImageDoc returns m's sticker when it shows as a picture: a still sticker
+// (WebP), or an animated one (.tgs) that carries a still preview. Video stickers are
+// clips (videoDoc). A .tgs without a preview stays a "[Sticker]" text row.
+func stickerImageDoc(m *tg.Message) (*tg.Document, bool) {
+	d, ok := stickerDocOf(m)
+	if !ok || strings.HasPrefix(d.MimeType, "video/") {
+		return nil, false
+	}
+	for _, a := range d.Attributes {
+		if _, ok := a.(*tg.DocumentAttributeVideo); ok {
+			return nil, false
+		}
+	}
+	if strings.HasPrefix(d.MimeType, "image/") || largestPhotoSizeType(d.Thumbs) != "" {
+		return d, true
+	}
+	return nil, false
+}
+
+// audioDoc returns m's document when it is audio: a voice note or an audio file.
+// Videos (round video messages included) and stickers are not audio.
+func audioDoc(m *tg.Message) (*tg.Document, bool) {
+	if _, _, isVideo := videoDoc(m); isVideo {
+		return nil, false
+	}
+	media, ok := m.GetMedia()
+	if !ok {
+		return nil, false
+	}
+	md, ok := media.(*tg.MessageMediaDocument)
+	if !ok {
+		return nil, false
+	}
+	d, ok := md.Document.(*tg.Document)
+	if !ok {
+		return nil, false
+	}
+	isAudio := strings.HasPrefix(d.MimeType, "audio/")
+	for _, a := range d.Attributes {
+		switch a.(type) {
+		case *tg.DocumentAttributeAudio:
+			isAudio = true
+		case *tg.DocumentAttributeSticker:
+			return nil, false
+		}
+	}
+	if !isAudio {
+		return nil, false
+	}
+	return d, true
+}
+
+// mediaBase builds the conversation-qualified media base for a message.
+func mediaBase(conversationID, msgID string) string {
+	switch {
+	case strings.HasPrefix(conversationID, "tg:user:"):
+		return "u" + strings.TrimPrefix(conversationID, "tg:user:") + "-" + msgID
+	case strings.HasPrefix(conversationID, "tg:chat:"):
+		return "g" + strings.TrimPrefix(conversationID, "tg:chat:") + "-" + msgID
+	case strings.HasPrefix(conversationID, "tg:channel:"):
+		return "c" + strings.TrimPrefix(conversationID, "tg:channel:") + "-" + msgID
+	}
+	return ""
+}
+
+// parseMediaBase reverses mediaBase into the conversation id and message id.
+func parseMediaBase(base string) (string, int, bool) {
+	parts := strings.SplitN(base, "-", 2)
+	if len(parts) != 2 || len(parts[0]) < 2 {
+		return "", 0, false
+	}
+	msgID, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return "", 0, false
+	}
+	var prefix string
+	switch parts[0][0] {
+	case 'u':
+		prefix = "tg:user:"
+	case 'g':
+		prefix = "tg:chat:"
+	case 'c':
+		prefix = "tg:channel:"
+	default:
+		return "", 0, false
+	}
+	return prefix + parts[0][1:], msgID, true
+}
+
+func docRefOf(d *tg.Document) docRef {
+	return docRef{
+		id:         d.ID,
+		accessHash: d.AccessHash,
+		fileRef:    d.FileReference,
+		size:       int64(d.Size),
+		mime:       d.MimeType,
+		thumbType:  largestPhotoSizeType(d.Thumbs),
+	}
+}
+
+// rememberDoc caches a video or audio document ref (FIFO-capped). Called from the
+// pump and the update-dispatcher goroutines, so guarded by mu.
+func (b *Bridge) rememberDoc(base string, d *tg.Document) docRef {
+	ref := docRefOf(d)
+	b.mu.Lock()
+	if _, exists := b.docs[base]; !exists {
+		b.docOrder = append(b.docOrder, base)
+		for len(b.docOrder) > maxStoredDocs {
+			old := b.docOrder[0]
+			b.docOrder = b.docOrder[1:]
+			delete(b.docs, old)
+		}
+	}
+	b.docs[base] = ref
+	b.mu.Unlock()
+	return ref
+}
+
+func (b *Bridge) cachedDoc(base string) (docRef, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ref, ok := b.docs[base]
+	return ref, ok
+}
+
+// videoContent builds the VIDEO media part and caches its download ref. GIF-style
+// clips get an animated preview on the phone, so only real videos carry a poster.
+func (b *Bridge) videoContent(conversationID, msgID string, d *tg.Document, gifLike bool) *outMediaContent {
+	base := mediaBase(conversationID, msgID)
+	if base == "" {
+		return nil
+	}
+	ref := b.rememberDoc(base, d)
+	mime := d.MimeType
+	if !strings.HasPrefix(mime, "video/") {
+		mime = "video/mp4"
+	}
+	gl := gifLike
+	mc := &outMediaContent{Format: "VIDEO", MimeType: mime, MediaID: videoPrefix + base, GifLike: &gl}
+	if !gifLike && ref.thumbType != "" {
+		mc.PosterMediaID = posterPrefix + base
+	}
+	return mc
+}
+
+// stickerContent builds the IMAGE part for a sticker shown as a picture and caches
+// its download ref.
+func (b *Bridge) stickerContent(conversationID, msgID string, d *tg.Document) *outMediaContent {
+	base := mediaBase(conversationID, msgID)
+	if base == "" {
+		return nil
+	}
+	b.rememberDoc(base, d)
+	return &outMediaContent{Format: "IMAGE", MimeType: "image/png", MediaID: stickerPrefix + base}
+}
+
+// audioContent builds the AUDIO media part and caches its download ref. The phone
+// reads the file itself for the length and waveform, so no poster or duration.
+func (b *Bridge) audioContent(conversationID, msgID string, d *tg.Document) *outMediaContent {
+	base := mediaBase(conversationID, msgID)
+	if base == "" {
+		return nil
+	}
+	b.rememberDoc(base, d)
+	mime := d.MimeType
+	if mime == "" {
+		mime = "audio/ogg"
+	}
+	return &outMediaContent{Format: "AUDIO", MimeType: mime, MediaID: audioPrefix + base}
+}
+
+// fetchMessageByBase re-fetches the single message behind base. Pump goroutine only
+// (reads the peer cache). Returns "" on success, else a reason.
+func (b *Bridge) fetchMessageByBase(ctx context.Context, base string) (*tg.Message, string) {
+	convoID, msgID, ok := parseMediaBase(base)
+	if !ok {
+		return nil, "bad media id"
+	}
+	ids := []tg.InputMessageClass{&tg.InputMessageID{ID: msgID}}
+	var res tg.MessagesMessagesClass
+	var err error
+	if strings.HasPrefix(convoID, "tg:channel:") {
+		pr, ok := b.peers[convoID]
+		if !ok {
+			return nil, "unknown channel (list first)"
+		}
+		res, err = b.client.API().ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+			Channel: &tg.InputChannel{ChannelID: pr.id, AccessHash: pr.hash},
+			ID:      ids,
+		})
+	} else {
+		res, err = b.client.API().MessagesGetMessages(ctx, ids)
+	}
+	if err != nil {
+		return nil, "getMessages: " + err.Error()
+	}
+	var msgs []tg.MessageClass
+	switch r := res.(type) {
+	case *tg.MessagesMessages:
+		msgs = r.Messages
+	case *tg.MessagesMessagesSlice:
+		msgs = r.Messages
+	case *tg.MessagesChannelMessages:
+		msgs = r.Messages
+	}
+	for _, mc := range msgs {
+		if m, ok := mc.(*tg.Message); ok && m.ID == msgID {
+			return m, ""
+		}
+	}
+	return nil, "message not found"
+}
+
+// resolveDoc re-fetches the message behind base and caches a fresh video or audio
+// ref.
+func (b *Bridge) resolveDoc(ctx context.Context, base string) (docRef, string) {
+	m, reason := b.fetchMessageByBase(ctx, base)
+	if reason != "" {
+		return docRef{}, reason
+	}
+	if d, _, ok := videoDoc(m); ok {
+		return b.rememberDoc(base, d), ""
+	}
+	if d, ok := audioDoc(m); ok {
+		return b.rememberDoc(base, d), ""
+	}
+	if d, ok := stickerImageDoc(m); ok {
+		return b.rememberDoc(base, d), ""
+	}
+	return docRef{}, "message has no video, audio or sticker"
+}
+
+// resolvePhoto re-fetches the message behind base and caches a fresh photo ref.
+func (b *Bridge) resolvePhoto(ctx context.Context, base string) (photoRef, string) {
+	m, reason := b.fetchMessageByBase(ctx, base)
+	if reason != "" {
+		return photoRef{}, reason
+	}
+	if media, ok := m.GetMedia(); ok {
+		if mp, ok := media.(*tg.MessageMediaPhoto); ok {
+			if pr, ok := b.rememberPhoto(base, mp); ok {
+				return pr, ""
+			}
+		}
+	}
+	return photoRef{}, "message has no photo"
+}
+
+// resolveDocOnPump runs resolveDoc on the pump goroutine.
+func (b *Bridge) resolveDocOnPump(base string) (docRef, string) {
+	var ref docRef
+	r := b.call(20*time.Second, func(ctx context.Context) string {
+		var reason string
+		ref, reason = b.resolveDoc(ctx, base)
+		return reason
+	})
+	if r != "" {
+		return docRef{}, r
+	}
+	return ref, ""
+}
+
+// downloadDocToFile writes the whole document to path with parallel part fetches.
+// Runs OFF the pump so a large file never stalls lists, fetches or sends; the gotd
+// client is safe for concurrent use while its run loop is up.
+func (b *Bridge) downloadDocToFile(ref docRef, path string) (int64, error) {
+	if !b.waitReady(25 * time.Second) {
+		return 0, errors.New("not connected")
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return 0, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), mediaDownloadTimeout)
+	defer cancel()
+	go func() {
+		select {
+		case <-b.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	loc := &tg.InputDocumentFileLocation{ID: ref.id, AccessHash: ref.accessHash, FileReference: ref.fileRef}
+	_, derr := downloader.NewDownloader().Download(b.client.API(), loc).WithThreads(mediaThreads).Parallel(ctx, f)
+	cerr := f.Close()
+	if derr != nil {
+		return 0, derr
+	}
+	if cerr != nil {
+		return 0, cerr
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	if st.Size() == 0 {
+		return 0, errors.New("empty file")
+	}
+	return st.Size(), nil
+}
+
+// DownloadMediaToFile writes the complete video ("tgv-") or audio ("tga-") file for
+// mediaID to path and returns its byte count, or -1 on any failure (never a partial
+// file). A failed download re-resolves the message once, since Telegram file
+// references expire.
+func (b *Bridge) DownloadMediaToFile(mediaID, path string) int64 {
+	var base string
+	switch {
+	case strings.HasPrefix(mediaID, videoPrefix):
+		base = strings.TrimPrefix(mediaID, videoPrefix)
+	case strings.HasPrefix(mediaID, audioPrefix):
+		base = strings.TrimPrefix(mediaID, audioPrefix)
+	default:
+		b.mediaDiag("bad media id", mediaID)
+		return -1
+	}
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		ref, ok := b.cachedDoc(base)
+		if !ok || attempt > 0 {
+			var reason string
+			if ref, reason = b.resolveDocOnPump(base); reason != "" {
+				os.Remove(path)
+				b.mediaDiag(reason, mediaID)
+				return -1
+			}
+		}
+		if ref.size > maxMediaBytes {
+			os.Remove(path)
+			b.mediaDiag("too large", mediaID)
+			return -1
+		}
+		n, err := b.downloadDocToFile(ref, path)
+		if err == nil {
+			return n
+		}
+		lastErr = err
+	}
+	os.Remove(path)
+	b.mediaDiag("download failed: "+lastErr.Error(), mediaID)
+	return -1
+}
+
+func (b *Bridge) mediaDiag(reason, mediaID string) {
+	bs, _ := json.Marshal(map[string]string{"tgMedia": reason, "id": mediaID})
+	b.emitEvent("DIAG", string(bs))
+}
+
+func (b *Bridge) FetchMessages(conversationID string, limit int, offsetID int) string {
+	// offsetID paginates into older history: 0 = newest page; a real message id =
+	// the batch strictly older than it (MTProto getHistory offset_id semantics).
+	// The old 25-cap is gone — infinite backfill needs full pages. Telegram's
+	// getHistory tops out at 100 per call, so clamp there (default 25 for a bad limit).
+	if limit <= 0 {
 		limit = 25
+	}
+	if limit > 100 {
+		limit = 100
 	}
 	r := b.call(30*time.Second, func(ctx context.Context) string {
 		peer, ok := b.inputPeerFor(conversationID)
@@ -954,8 +1817,9 @@ func (b *Bridge) FetchMessages(conversationID string, limit int) string {
 		}
 
 		res, err := b.client.API().MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-			Peer:  peer,
-			Limit: limit,
+			Peer:     peer,
+			OffsetID: offsetID, // 0 = newest; else the anchor to page strictly older than
+			Limit:    limit,
 		})
 		if err != nil {
 			return emptyMsgs("getHistory: " + err.Error())
@@ -989,6 +1853,14 @@ func (b *Bridge) FetchMessages(conversationID string, limit int) string {
 				continue // skip service/empty messages
 			}
 			out.Messages = append(out.Messages, b.buildOutMsg(conversationID, m, userByID))
+		}
+		// Cursor = the OLDEST message id in this raw batch. msgs is newest-first, so
+		// the last element is oldest; feed its id back as offsetID to page older.
+		// Keyed off the raw oldest id (including skipped service/empty messages) so the
+		// next page never straddles or repeats a boundary. Empty when the batch is
+		// empty = true top of the thread, and the phone stops backfilling there.
+		if n := len(msgs); n > 0 {
+			out.Cursor = fmt.Sprintf("%d", msgs[n-1].GetID())
 		}
 		bs, _ := json.Marshal(out)
 		return string(bs)

@@ -28,7 +28,7 @@ import fi.mirrormsg.telegrambridge.LiveSink
  * flag set on successful login — never a blocking bridge call. connectIfPossible()
  * is where the actual gotd connect happens, on a background thread.
  */
-class TelegramService : MessagingService {
+class TelegramService : MessagingService, ReactionRemover {
 
     override val id = "tgnative"
     override val displayName = "Telegram"
@@ -41,7 +41,7 @@ class TelegramService : MessagingService {
         Mirror.appContext?.let { prefs(it).getBoolean(KEY_AUTHED, false) } ?: false
 
     override fun accountLabel(): String =
-        Mirror.appContext?.let { prefs(it).getString(KEY_PHONE, "") ?: "" } ?: ""
+        Mirror.appContext?.let { Vault.getString(prefs(it), KEY_PHONE) } ?: ""
 
     /**
      * Bring Telegram online: creating the bridge starts the gotd run loop and loads
@@ -94,36 +94,113 @@ class TelegramService : MessagingService {
             LogStore.w(TAG, "TG listConversations failed: ${e.message}")
             return "{\"conversations\":[]}"
         }
-        // TEMP diagnostics (remove once sub-accounts land): the conversation JSON,
-        // and a one-shot dump of chat folders (the grouping behind channel sub-accounts).
-        LogStore.i(TAG, "TG-CONVOS: ${json.take(1800)}")
-        if (!dumpedFolders) {
-            dumpedFolders = true
-            try {
-                val fj = bridge().listFolders()
-                LogStore.i(TAG, "TG-SUBACCOUNTS: $fj")
-                // Prove getPeerDialogs: resolve the first folder's chats to a full list.
-                val arr = org.json.JSONObject(fj).optJSONArray("folders")
-                val fid = arr?.optJSONObject(0)?.optInt("id", -1) ?: -1
-                if (fid >= 0) LogStore.i(TAG,
-                    "TG-FOLDERCONVOS[$fid]: ${bridge().listFolderConversations(fid.toLong(), 15L).take(1200)}")
-            } catch (e: Throwable) { LogStore.w(TAG, "TG folder diag failed: ${e.message}") }
-        }
-        // Bridge returns valid JSON on success; guard against a stray diagnostic.
         return if (json.startsWith("{")) json else "{\"conversations\":[]}"
     }
 
+    // ---- Hierarchical navigation: folders (like Discord servers) + Direct Messages -
+
+    // Telegram is a hierarchy on the watch: root -> each chat FOLDER (drillable) plus a
+    // "Direct Messages" bucket -> that level's chats. The watch drills via KEY_REQ_ENTER;
+    // the phone tracks the path in Mirror.navStack and asks each level here. This is the
+    // same generic nav the Discord account uses — no watch changes, just this mapping.
+    override val hierarchical = true
+
+    override fun listContext(count: Int, context: List<String>): String {
+        // Resolve against the CURRENT (deepest) context token; each is self-identifying.
+        val cur = context.lastOrNull()
+        return when {
+            cur == null -> telegramRootJson()          // root: folders + Direct Messages
+            cur == "dms" -> {                          // the default all-chats list (OPEN)
+                // Bridge-direct on purpose: bypasses listConversations' legacy
+                // activeTgFolder branch so a previously-active folder can't leak in here.
+                val json = try { bridge().listConversations(count.toLong()) }
+                catch (e: Throwable) { LogStore.w(TAG, "TG DMs failed: ${e.message}"); "{\"conversations\":[]}" }
+                if (json.startsWith("{")) json else "{\"conversations\":[]}"
+            }
+            cur.startsWith("folder:") -> {             // a folder's chats (OPEN)
+                val fid = cur.removePrefix("folder:").toLongOrNull() ?: return "{\"conversations\":[]}"
+                val json = try { bridge().listFolderConversations(fid, count.toLong()) }
+                catch (e: Throwable) { LogStore.w(TAG, "TG folder chats failed: ${e.message}"); "{\"conversations\":[]}" }
+                if (json.startsWith("{")) json else "{\"conversations\":[]}"
+            }
+            else -> "{\"conversations\":[]}"
+        }
+    }
+
+    // The Telegram root: the "Direct Messages" bucket on top, then an ENTER row per
+    // chat folder below it. Folder titles/ids come from the gotd session immediately
+    // (no gateway wait, unlike Discord's guilds).
+    private fun telegramRootJson(): String {
+        val convos = org.json.JSONArray()
+        convos.put(enterEntry("dms", "Direct Messages"))
+        try {
+            val folders = org.json.JSONObject(bridge().listFolders()).optJSONArray("folders")
+            if (folders != null) for (i in 0 until folders.length()) {
+                val f = folders.optJSONObject(i) ?: continue
+                val fid = f.optInt("id", -1); if (fid < 0) continue
+                val title = f.optString("title").ifEmpty { "Folder" }
+                convos.put(enterEntry("folder:$fid", title))
+            }
+        } catch (e: Throwable) { LogStore.w(TAG, "TG root build failed: ${e.message}") }
+        return org.json.JSONObject().put("conversations", convos).toString()
+    }
+
+    /**
+     * Restore the nav path when a notification force-opens a thread, so backing out
+     * climbs correctly. A foldered chat backs out to its folder (folder chat lists carry
+     * the same convoIds, so we can resolve it); everything else backs out to Direct
+     * Messages, where every chat is reachable. A chat can sit in several folders — the
+     * first match is a fine back-out target.
+     */
+    override fun forceOpenNavContext(convoId: String): List<String> {
+        val folderId = folderForConvo(convoId)
+        return if (folderId >= 0) listOf("folder:$folderId") else listOf("dms")
+    }
+
+    private fun folderForConvo(convoId: String): Int {
+        return try {
+            val folders = org.json.JSONObject(bridge().listFolders()).optJSONArray("folders") ?: return -1
+            for (i in 0 until folders.length()) {
+                val f = folders.optJSONObject(i) ?: continue
+                val chats = f.optJSONArray("chats") ?: continue
+                for (j in 0 until chats.length()) if (chats.optString(j) == convoId) return f.optInt("id", -1)
+            }
+            -1
+        } catch (e: Throwable) { -1 }
+    }
+
+    private fun enterEntry(context: String, name: String): org.json.JSONObject =
+        org.json.JSONObject()
+            .put("conversationID", context)   // unused for ENTER, but keeps the shape
+            .put("name", name)
+            .put("navKind", "ENTER")
+            .put("navContext", context)
+
     override fun fetchMessages(conversationId: String, count: Long, cursor: String): String {
+        // cursor is the offset_id anchor: empty/unparseable = 0 = newest page; a real
+        // message id = the batch strictly older than it. gomobile maps the Go `int`
+        // offsetID param to a Long on this call.
+        val offsetId = cursor.toLongOrNull() ?: 0L
         val json = try {
-            bridge().fetchMessages(conversationId, count)
+            bridge().fetchMessages(conversationId, count, offsetId)
         } catch (e: Throwable) {
             LogStore.w(TAG, "TG fetchMessages failed: ${e.message}")
             return "{\"messages\":[]}"
         }
-        // TEMP diagnostic: how many messages did the bridge return, and any tgError?
-        val n = try { org.json.JSONObject(json).optJSONArray("messages")?.length() ?: 0 } catch (e: Throwable) { -1 }
-        val err = if (json.contains("tgError")) " ${json.take(160)}" else ""
-        LogStore.i(TAG, "TG fetch $conversationId -> $n msgs$err")
+        // Capture the bridge's cursor (= oldest message id in this batch) so the generic
+        // backfill can page older. A non-empty cursor that ADVANCED past the one we sent
+        // means more history exists; an empty cursor (true top) or a non-advancing one
+        // means stop. The "advanced" guard is the safety that stops a stuck bridge from
+        // silently re-fetching the same batch forever (the failure the brief warns about).
+        val nextCursor = try {
+            org.json.JSONObject(json).optString("cursor", "")
+        } catch (e: Throwable) { "" }
+        if (nextCursor.isNotEmpty() && nextCursor != cursor) {
+            Mirror.backfillCursor[conversationId] = nextCursor
+            Mirror.backfillExhausted[conversationId] = false
+        } else {
+            Mirror.backfillExhausted[conversationId] = true
+        }
         return if (json.startsWith("{")) json else "{\"messages\":[]}"
     }
 
@@ -184,6 +261,14 @@ class TelegramService : MessagingService {
         return result
     }
 
+    // Sending the same reaction again from the watch takes it back. MTProto's
+    // messages.sendReaction with no reaction clears the user's reaction on the message;
+    // the bridge answers {"messageId"} when done (also when there was nothing to clear).
+    override fun removeReaction(
+        conversationId: String, targetMessageId: String,
+        targetFromMe: Boolean, emoji: String
+    ): String = sendReaction(conversationId, targetMessageId, targetFromMe, "")
+
     override fun replyTokenFor(conversationId: String): String = ""   // convoId is the routing
 
     // Mark the thread read on Telegram up through messageId. The bridge routes
@@ -240,8 +325,8 @@ class TelegramService : MessagingService {
         maxW: Int, maxH: Int, maxBytes: Int, quality: Int
     ): String =
         try {
-            // Telegram ignores decryptionKeyB64 — the download ref lives in the
-            // bridge's photo cache, keyed by mediaId (= the message ID).
+            // Telegram ignores decryptionKeyB64 — the download ref lives in the bridge,
+            // keyed by mediaId (a photo's "tgi-" id, or a video poster's "tgp-" id).
             bridge().downloadImageForWatch(
                 mediaId, maxW.toLong(), maxH.toLong(), maxBytes.toLong(), quality.toLong()
             )
@@ -249,6 +334,37 @@ class TelegramService : MessagingService {
             LogStore.e(TAG, "TG downloadImage failed", e)
             "{\"error\":\"${e.message}\"}"
         }
+
+    // Video ("tgv-") and voice notes / audio ("tga-"): the bridge writes the whole
+    // playable file to path; no key needed. Returns the byte count, or -1 on failure.
+    override fun downloadMediaToFile(mediaId: String, decryptionKeyB64: String, path: String): Long =
+        try {
+            bridge().downloadMediaToFile(mediaId, path)
+        } catch (e: Throwable) {
+            LogStore.e(TAG, "TG downloadMediaToFile failed", e)
+            -1L
+        }
+
+    // Contact photos. A chat row carries its photo's id ("<convoId>|<photo id>") from the
+    // bridge, so the row path never touches the network; ENTER rows (Direct Messages,
+    // folders) have none and keep their letter. Without a row (a notification) the bridge
+    // answers from the photos its lists and live updates have shown it.
+    override fun avatarId(conversationId: String, row: org.json.JSONObject?): String? {
+        if (row != null) return row.optString("avatarID").ifEmpty { null }
+        return try {
+            bridge().avatarID(conversationId).ifEmpty { null }
+        } catch (e: Throwable) {
+            LogStore.w(TAG, "TG avatarId failed: ${e.message}")
+            null
+        }
+    }
+
+    // The bridge throws when the photo can't be had right now, so the phone retries
+    // rather than remembering "no photo".
+    override fun avatarBytes(avatarId: String): ByteArray? {
+        val bytes = bridge().avatarBytes(avatarId)
+        return if (bytes == null || bytes.isEmpty()) null else bytes
+    }
 
     // Telegram photos are never inline — they always download via downloadImage.
     override fun processInlineImage(
@@ -261,11 +377,11 @@ class TelegramService : MessagingService {
         private const val PREFS = "mirrormsg"
         private const val KEY_AUTHED = "tg_authed"
         private const val KEY_PHONE = "tg_phone"
+        private const val KEY_SESSION_KEY = "tg_session_key"
         private const val SESSION_FILE = "tg_session.json"
 
         private val lock = Any()
         @Volatile private var tgBridge: TgBridge? = null
-        @Volatile private var dumpedFolders = false  // one-shot TG-FOLDERS diagnostic
 
         /**
          * The single shared bridge — its gotd run loop lives process-wide, so login
@@ -278,7 +394,7 @@ class TelegramService : MessagingService {
                 tgBridge ?: run {
                     val ctx = Mirror.appContext!!
                     val path = File(ctx.filesDir, SESSION_FILE).absolutePath
-                    Telegrambridge.newTelegramBridge(path).also { b ->
+                    Telegrambridge.newTelegramBridge(path, sessionKey(ctx)).also { b ->
                         // Live events from the gotd update dispatcher. MESSAGE routes
                         // into the shared pipeline (store + notify); REACTION updates
                         // the badge store; DIAG surfaces bridge diagnostics.
@@ -304,6 +420,17 @@ class TelegramService : MessagingService {
             }
         }
 
+        // The key that seals tg_session.json (the login), made once and kept in the
+        // Keystore vault. The bridge seals an older plain session on first load.
+        private fun sessionKey(ctx: Context): String {
+            val p = prefs(ctx)
+            Vault.getString(p, KEY_SESSION_KEY).let { if (it.isNotEmpty()) return it }
+            val bytes = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+            val key = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+            Vault.putString(p, KEY_SESSION_KEY, key)
+            return key
+        }
+
         private fun prefs(ctx: Context) =
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
@@ -314,7 +441,8 @@ class TelegramService : MessagingService {
 
         /** Called by TelegramLoginActivity once login reports "authorized". */
         fun markLoggedIn(ctx: Context, phone: String) {
-            prefs(ctx).edit().putBoolean(KEY_AUTHED, true).putString(KEY_PHONE, phone).apply()
+            prefs(ctx).edit().putBoolean(KEY_AUTHED, true).apply()
+            Vault.putString(prefs(ctx), KEY_PHONE, phone)
         }
     }
 }

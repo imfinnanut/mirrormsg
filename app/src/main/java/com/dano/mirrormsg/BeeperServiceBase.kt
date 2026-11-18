@@ -58,9 +58,6 @@ abstract class BeeperServiceBase : MessagingService {
         // Process-wide: the distinct-protocol diagnostic logs once total, not
         // once per Beeper account.
         @Volatile private var protocolsLogged = false
-        // Chat-column schema dump runs once PER PROTOCOL (so each network's rows
-        // get surfaced once), used to discover how the provider tags rooms.
-        private val columnsDumped = java.util.Collections.synchronizedSet(HashSet<String>())
     }
 
     private val ctx: Context get() = Mirror.appContext!!
@@ -155,7 +152,6 @@ abstract class BeeperServiceBase : MessagingService {
             return false
         }
         if (observer == null) {
-            dumpChatColumnsOnce()
             primeLastSeen()
             registerObserver()
             LogStore.i(TAG, "$logPrefix $displayName connected, observing chats")
@@ -260,13 +256,28 @@ abstract class BeeperServiceBase : MessagingService {
         } catch (e: Throwable) { errJson(e) }
     }
 
+    // Backfill via OFFSET pagination. The Beeper provider ignores every before/id
+    // anchor (verified) but honors `offset` on the messages query: offset=N skips the
+    // N newest and returns older ones, up to Beeper's retained depth. So the opaque
+    // cursor the generic backfill hands back is {"offset":N}:
+    //   cursor "" (initial open) -> offset 0, take `count` newest; cursor advances to
+    //     the rows returned. Backfill cursor N -> offset N, next older `count`; advance
+    //     by rows actually returned (handles the partial batch at the floor cleanly).
+    //   0 rows -> past Beeper's floor for this chat -> backfillExhausted.
+    // Keyed by the VERBATIM conversationId (must match currentOpenConvoId for the
+    // generic lookup). count is the limit (backfill sends BACKFILL_BATCH=80).
     override fun fetchMessages(conversationId: String, count: Long, cursor: String): String {
         return try {
-            val msgs = fetchRoomMessages(conversationId, count.toInt().coerceIn(1, 200))
-            // Diagnostic: confirms on-demand fetch is reached for a given room and
-            // how many messages the provider returns (e.g. opening an unpumped
-            // group — is fetch called, and does the provider have its history?).
-            LogStore.i(TAG, "$logPrefix fetchMessages($conversationId) -> ${msgs.size} msgs")
+            val offset = if (cursor.isEmpty()) 0 else
+                try { JSONObject(cursor).optInt("offset", 0) } catch (_: Exception) { 0 }
+            val msgs = fetchRoomMessages(conversationId, count.toInt().coerceIn(1, 500), offset)
+            if (msgs.isEmpty()) {
+                Mirror.backfillExhausted[conversationId] = true
+            } else {
+                Mirror.backfillCursor[conversationId] =
+                    JSONObject().put("offset", offset + msgs.size).toString()
+                Mirror.backfillExhausted[conversationId] = false
+            }
             val arr = JSONArray()
             for (m in msgs) arr.put(m)
             JSONObject().put("messages", arr).toString()
@@ -327,11 +338,12 @@ abstract class BeeperServiceBase : MessagingService {
     // open-fetch path never reads it.
     @Volatile private var reactionsChangedInFetch = false
 
-    private fun fetchRoomMessages(roomId: String, count: Int): List<JSONObject> {
+    private fun fetchRoomMessages(roomId: String, count: Int, offset: Int = 0): List<JSONObject> {
         val out = ArrayList<JSONObject>()
         reactionsChangedInFetch = false
         val context = Mirror.appContext ?: return out
-        val uri = Uri.parse("$MSGS_URI?roomIds=" + Uri.encode(roomId) + "&limit=$count")
+        val uri = Uri.parse("$MSGS_URI?roomIds=" + Uri.encode(roomId) + "&limit=$count" +
+            (if (offset > 0) "&offset=$offset" else ""))
         try {
             val cur = context.contentResolver.query(uri, null, null, null, null) ?: return out
             cur.use { c ->
@@ -391,6 +403,16 @@ abstract class BeeperServiceBase : MessagingService {
                         ((if (idName >= 0) c.getString(idName) else null) ?: "")
                     val hasImage = idImg >= 0 && !c.getString(idImg).isNullOrEmpty()
                     val hasVideo = idVid >= 0 && !c.getString(idVid).isNullOrEmpty()
+                    // Busy Discord channels expose companion rows per message (the
+                    // Matrix event split into primary + secondary metadata/edit/
+                    // reaction-holder events): same sender + ~same ts, but NO text,
+                    // image, or video. They're not renderable messages — the watch
+                    // draws an empty body as "[Image]" and their presence shifts the
+                    // sender/body pairing. Drop any row with nothing to show. (Reaction
+                    // capture already happened above, keyed by mid, so we don't lose
+                    // reactions that ride a secondary row — those were merged before
+                    // this skip.)
+                    if (text.isEmpty() && !hasImage && !hasVideo) continue
                     if (hasImage || hasVideo) {
                         LogStore.i(TAG, "$logPrefix media row img=$hasImage vid=$hasVideo ts=$tsMs")
                     }
@@ -471,59 +493,6 @@ abstract class BeeperServiceBase : MessagingService {
         }
     }
 
-    // Diagnostic: dump the full chats-table schema + per-row values (message
-    // content redacted) for THIS protocol, once. This is how we discover how the
-    // provider distinguishes room kinds — e.g. a Discord DM vs a group/server
-    // channel — which columns exist (type/isGroup/memberCount/guild/etc.) and
-    // what they hold. Read the "chat columns =" line for the schema, then the
-    // "chat[n]" lines to see how DM rows differ from group rows.
-    private fun dumpChatColumnsOnce() {
-        if (!columnsDumped.add(protocol)) return
-        val context = Mirror.appContext ?: return
-        try {
-            val uri = Uri.parse("$CHATS_URI?protocol=$protocol&limit=30")
-            context.contentResolver.query(uri, null, null, null, null)?.use { c ->
-                val cols = c.columnNames
-                LogStore.i(TAG, "$logPrefix chat columns = ${cols.joinToString()}")
-                var n = 0
-                while (c.moveToNext() && n < 30) {
-                    n++
-                    val sb = StringBuilder()
-                    for (i in cols.indices) {
-                        val name = cols[i]
-                        // Redact message content; keep structural fields + title
-                        // (needed to tell a person-DM from a channel/group name).
-                        if (name == "messagePreview" || name == "preview") continue
-                        val v = try { c.getString(i) } catch (e: Exception) { "<bin>" }
-                        sb.append(name).append('=').append(v ?: "null").append("  ")
-                    }
-                    LogStore.i(TAG, "$logPrefix chat[$n] $sb")
-                }
-            }
-            probeInboxFilter(context)
-        } catch (e: Exception) {
-            LogStore.w(TAG, "$logPrefix chat column dump failed: ${e.message}")
-        }
-    }
-
-    // Probe: does the content provider honor an undocumented `inbox` filter
-    // (mirroring the Desktop API's primary/low-priority/archive)? If the filtered
-    // counts differ from the unfiltered count, we have a clean way to hide message
-    // requests / spam (X DM requests, etc.) without a per-row column. Counts only —
-    // no titles/content logged.
-    private fun probeInboxFilter(context: Context) {
-        fun count(extra: String): Int = try {
-            val uri = Uri.parse("$CHATS_URI?protocol=$protocol&limit=200$extra")
-            context.contentResolver.query(uri, null, null, null, null)?.use { it.count } ?: -1
-        } catch (e: Exception) { -2 }
-        val all     = count("")
-        val primary = count("&inbox=primary")
-        val lowPri  = count("&inbox=low-priority")
-        val reqs    = count("&inbox=requests")
-        LogStore.i(TAG, "$logPrefix inbox-filter probe: all=$all primary=$primary " +
-            "low-priority=$lowPri requests=$reqs")
-    }
-
     private fun registerObserver() {
         val context = Mirror.appContext ?: return
         val ht = HandlerThread("beeper-$id-observer").also { it.start() }
@@ -602,16 +571,22 @@ abstract class BeeperServiceBase : MessagingService {
             context.contentResolver.query(uri, null, null, null, null)?.use { c ->
                 val idRoom = c.getColumnIndex("roomId")
                 val idTs   = c.getColumnIndex("timestamp")
+                var advanced = 0  // BEEPER-OBS-DIAG
                 while (c.moveToNext()) {
                     val rid = (if (idRoom >= 0) c.getString(idRoom) else null) ?: continue
                     val tsMs = if (idTs >= 0) c.getLong(idTs) else 0L
                     val prev = lastSeenTs[rid] ?: 0L
                     if (tsMs > prev) {
+                        advanced++  // BEEPER-OBS-DIAG
                         LogStore.i(TAG, "$logPrefix $rid advanced ts=$tsMs prev=$prev — pumping")
                         lastSeenTs[rid] = tsMs
                         pumpRoom(rid, prev)
                     }
                 }
+                // BEEPER-OBS-DIAG: proves the chats observer actually FIRED (and
+                // whether it saw any advance). No line at all when a message arrives
+                // = observer never woke = Beeper isn't notifying us for this protocol.
+                LogStore.i(TAG, "$logPrefix BEEPER-OBS-DIAG onChatsChanged fired, advanced=$advanced")
             }
         } catch (e: Exception) {
             LogStore.e(TAG, "$logPrefix onChatsChanged failed", e)

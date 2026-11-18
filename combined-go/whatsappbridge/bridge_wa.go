@@ -1,6 +1,6 @@
 // Package whatsappbridge is the native WhatsApp bridge for MirrorMsg. It wraps
 // whatsmeow (the Go WhatsApp-web multidevice client) and exposes the same
-// gomobile surface shape as mirrorbridge (Google) and fbmessagebridge (Facebook):
+// gomobile surface shape as the other native bridges:
 // an EventSink the Kotlin side implements, a NewBridge constructor, and a flat
 // set of lifecycle/data methods.
 //
@@ -21,10 +21,13 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,15 +37,17 @@ import (
 
 	// Reuse the EXACT watch image encoder Google uses (scale + 4bpp palettize),
 	// so WhatsApp images render identically. We only do the WhatsApp-specific
-	// download/decrypt here, then hand raw bytes to mirrorbridge.EncodeImageForWatch.
-	"fi.mirrormsg/mirrorbridge"
+	// download/decrypt here, then hand raw bytes to watchimage.EncodeImageForWatch.
+	"fi.mirrormsg/watchimage"
 
 	"go.mau.fi/whatsmeow"
+	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
 	// Image download handles are persisted as marshaled ImageMessage protos so
 	// images survive an app restart. If this proto import path is wrong for this
 	// whatsmeow version, the compile error names the right one (older layout is
 	// "go.mau.fi/whatsmeow/binary/proto" with type waProto.ImageMessage).
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -72,11 +77,18 @@ type Bridge struct {
 	cancel    context.CancelFunc
 	mu        sync.Mutex
 
+	// WhatsApp Web version lookup (see fetchLatestWAVersion). verLatest is written
+	// once by the lookup goroutine, before verDone closes; read only after verDone.
+	verPath   string
+	verDone   chan struct{}
+	verLatest store.WAVersionContainer
+
 	// Chat index: whatsmeow keeps no message archive and only delivers the chat
 	// list once (via HistorySync, right after linking), so we capture it here and
 	// persist to chatsPath as JSON. Live messages keep it current. ListConversations
 	// serves the watch's conversation list from this.
 	chatsPath string
+	msgsDir   string // dir holding one JSON file of messages per chat
 	chatsMu   sync.Mutex
 	chats     map[string]*chatEntry
 
@@ -109,8 +121,16 @@ type Bridge struct {
 	// spam the log for the same group. Guarded by groupMu.
 	groupTried map[string]bool
 
-	// Guards the one-shot read-only contacts diagnostic (DumpContacts).
-	contactsDumpOnce sync.Once
+	// Contact/group photos: chat key -> the picture's id (or "none"), looked up in
+	// the background (one at a time) and persisted, so the chat list can name each
+	// chat's photo without a network call. See AvatarID / AvatarURL.
+	avatarPath    string
+	avatarMu      sync.Mutex
+	avatars       map[string]*avatarEntry
+	avatarFailed  map[string]time.Time
+	avatarPending map[string]bool
+	avatarQueue   chan string
+	avatarLearned bool
 }
 
 // maxStoredImages caps how many image download-handles we keep (FIFO).
@@ -145,6 +165,20 @@ type msgEntry struct {
 	// alongside the download handle (imgStore), so after a restart the message
 	// still advertises its image AND the handle is there to serve it.
 	ImgMime string `json:"im,omitempty"`
+	// VidMime is the video's mimetype when this message is a video. Its download
+	// handle lives in the same store as images, under "v:"+ID, so a video can't
+	// collide with an image and survives restarts the same way.
+	VidMime string `json:"vm,omitempty"`
+	// GifLike marks a video WhatsApp flagged for GIF playback (a looping clip).
+	GifLike bool `json:"gl,omitempty"`
+	// VidThumb is the video's embedded JPEG thumbnail, base64, sent as the poster.
+	VidThumb string `json:"vt,omitempty"`
+	// AudMime is the audio's mimetype when this message is a voice note or audio
+	// file. Its download handle lives in the media store under "a:"+ID.
+	AudMime string `json:"am,omitempty"`
+	// AlbumID is the album parent's message id when this picture or video is one
+	// item of a WhatsApp album; the phone groups messages sharing it.
+	AlbumID string `json:"al,omitempty"`
 	// ReplyToID is the quoted message's id when this message is a reply (from
 	// whatsmeow ContextInfo.StanzaID). The phone resolves the quoted sender/text
 	// from the stored thread by this id; "" for non-replies.
@@ -152,7 +186,10 @@ type msgEntry struct {
 }
 
 // maxMsgsPerChat caps the per-chat history we keep (and serve to the watch).
-const maxMsgsPerChat = 50
+// Raised from 50 so a FULL history sync's depth survives (measured up to ~380
+// displayable in an active group). Aligned with the phone-side MessageStore
+// MAX_PER_CONVO = 1000, so bridge and phone trim to the same depth.
+const maxMsgsPerChat = 1000
 
 // addMsg appends a message (deduped by ID). Call sortAndCap after a batch.
 func (e *chatEntry) addMsg(m *msgEntry) {
@@ -169,7 +206,16 @@ func (e *chatEntry) addMsg(m *msgEntry) {
 // sortAndCap orders messages oldest->newest, trims to the cap, and refreshes the
 // list-row summary (snippet/timestamp/fromMe) from the newest message.
 func (e *chatEntry) sortAndCap() {
-	sort.Slice(e.Messages, func(i, j int) bool { return e.Messages[i].TsMicros < e.Messages[j].TsMicros })
+	// Sort by (timestamp, id). WhatsApp message timestamps are second-resolution,
+	// so many messages in a busy chat share the same TsMicros; the id tiebreak
+	// gives a total, deterministic order so the (ts,id) backfill cursor pages
+	// through same-second runs without stalling or skipping.
+	sort.Slice(e.Messages, func(i, j int) bool {
+		if e.Messages[i].TsMicros != e.Messages[j].TsMicros {
+			return e.Messages[i].TsMicros < e.Messages[j].TsMicros
+		}
+		return e.Messages[i].ID < e.Messages[j].ID
+	})
 	if len(e.Messages) > maxMsgsPerChat {
 		e.Messages = e.Messages[len(e.Messages)-maxMsgsPerChat:]
 	}
@@ -200,8 +246,108 @@ func (b *Bridge) emit(eventType, jsonPayload string) {
 // the cookie bridges (which take a one-shot session JSON string), whatsmeow owns
 // and re-keys its store continuously, so we point it at a file rather than pass a
 // blob.
+// fallbackWAVersion is a known-good WhatsApp Web version (upstream whatsmeow main,
+// Sept 2026). WhatsApp rejects clients reporting an old version with
+// err-client-outdated (405), and the pinned whatsmeow's built-in version went
+// stale. The live lookup (fetchLatestWAVersion) supersedes this when it succeeds.
+var fallbackWAVersion = store.WAVersionContainer{2, 3000, 1047769893}
+
+// applyWAVersion switches the reported WhatsApp Web version to v if v is newer
+// than the current one. Must run while disconnected (it writes whatsmeow package
+// globals read at connect time). The pinned whatsmeow's SetWAVersion does not
+// refresh the login user-agent's AppVersion (fixed upstream later), so set it too.
+func applyWAVersion(v store.WAVersionContainer) bool {
+	if v.IsZero() || !store.GetWAVersion().LessThan(v) {
+		return false
+	}
+	store.SetWAVersion(v)
+	store.BaseClientPayload.UserAgent.AppVersion = v.ProtoAppVersion()
+	return true
+}
+
+// fetchLatestWAVersion asks web.whatsapp.com for its current version and caches
+// it to verPath so the next launch starts on it without waiting. Runs once per
+// bridge, in the background; Connect paths pick the result up via syncWAVersion.
+func (b *Bridge) fetchLatestWAVersion() {
+	defer close(b.verDone)
+	ctx, cancel := context.WithTimeout(b.ctx, 8*time.Second)
+	defer cancel()
+	v, err := whatsmeow.GetLatestVersion(ctx, nil)
+	if err != nil || v == nil {
+		msg := "no version returned"
+		if err != nil {
+			msg = err.Error()
+		}
+		b.emit("DIAG", fmt.Sprintf("WA-VERSION lookup failed (%s); using %s", scrubURLs(msg), store.GetWAVersion().String()))
+		return
+	}
+	b.verLatest = *v
+	_ = os.WriteFile(b.verPath, []byte(v.String()), 0600)
+}
+
+// syncWAVersion applies the live-lookup result if it's in and newer. wait bounds
+// how long to block for it: 0 never blocks (session restore can run on the
+// startup path), pairing waits a few seconds (it runs on the pair screen's worker
+// thread, and pairing is where an outdated version fails outright).
+func (b *Bridge) syncWAVersion(wait time.Duration) {
+	if wait <= 0 {
+		select {
+		case <-b.verDone:
+		default:
+			return
+		}
+	} else {
+		select {
+		case <-b.verDone:
+		case <-time.After(wait):
+			return
+		}
+	}
+	if applyWAVersion(b.verLatest) {
+		b.emit("DIAG", "WA-VERSION using live "+b.verLatest.String())
+	}
+}
+
 func NewBridge(storePath string, sink EventSink) (*Bridge, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Report a current WhatsApp Web version before anything connects: the newer
+	// of the pinned default, the known-good fallback, and last run's live lookup.
+	applyWAVersion(fallbackWAVersion)
+	verPath := storePath + ".waversion"
+	if data, err := os.ReadFile(verPath); err == nil {
+		if v, err := store.ParseVersion(strings.TrimSpace(string(data))); err == nil {
+			applyWAVersion(v)
+		}
+	}
+
+	// Request a FULL history sync (instead of the default recent-only) so a
+	// (re-)link pulls deep per-chat history — the source of WhatsApp backfill.
+	// store.DeviceProps is a whatsmeow package global read when the pairing
+	// ClientPayload is built, so it MUST be set before pairing — NewBridge runs
+	// before Connect, so this covers the re-link. We set only the full-sync LIMIT
+	// fields on the existing config (rather than replacing the whole struct) so the
+	// library's default support flags — SupportGroupHistory in particular — stay on.
+	// Bounded by the phone's own retention + these limits, and one-shot: there's no
+	// re-request without a re-link, so depth is captured at link time.
+	store.DeviceProps.RequireFullSync = proto.Bool(true)
+	if store.DeviceProps.HistorySyncConfig == nil {
+		store.DeviceProps.HistorySyncConfig = &waCompanionReg.DeviceProps_HistorySyncConfig{}
+	}
+	store.DeviceProps.HistorySyncConfig.FullSyncDaysLimit = proto.Uint32(365)
+	store.DeviceProps.HistorySyncConfig.FullSyncSizeMbLimit = proto.Uint32(10240)
+	store.DeviceProps.HistorySyncConfig.StorageQuotaMb = proto.Uint32(10240)
+
+	// A store left by the short-lived encrypted build can't be read by plain SQLite:
+	// remove it (and its journals) so WhatsApp just needs linking again.
+	if isUnreadableStore(storePath) {
+		for _, sfx := range []string{"", "-wal", "-shm", "-journal"} {
+			_ = os.Remove(storePath + sfx)
+		}
+		if sink != nil {
+			sink.OnEvent("DIAG", "WA-STORE encrypted store removed; link WhatsApp again")
+		}
+	}
 
 	// Open a PURE-GO SQLite connection ourselves (driver name "sqlite" = modernc),
 	// then hand the live *sql.DB to whatsmeow with the "sqlite3" DIALECT (which
@@ -253,9 +399,23 @@ func NewBridge(storePath string, sink EventSink) (*Bridge, error) {
 		pushNames:  make(map[string]string),
 		groupNames: make(map[string]string),
 		groupTried: make(map[string]bool),
+		verPath:    verPath,
+		verDone:    make(chan struct{}),
+
+		avatars:       make(map[string]*avatarEntry),
+		avatarFailed:  make(map[string]time.Time),
+		avatarPending: make(map[string]bool),
+		avatarQueue:   make(chan string, 512),
 	}
+	b.emit("DIAG", "WA-VERSION start "+store.GetWAVersion().String())
+	go b.fetchLatestWAVersion()
 	client.AddEventHandler(b.handleEvent)
 	b.chatsPath = storePath + ".chats.json"
+	// Per-chat message files live under this dir. The chat index (chatsPath) now
+	// holds SUMMARY ROWS ONLY (no messages), so a live message rewrites just one
+	// small per-chat file + the small index — not the whole history of every chat.
+	b.msgsDir = storePath + ".msgs"
+	_ = os.MkdirAll(b.msgsDir, 0700)
 	b.loadChats()
 	b.imgPath = storePath + ".images.json"
 	b.loadImages()
@@ -263,7 +423,23 @@ func NewBridge(storePath string, sink EventSink) (*Bridge, error) {
 	b.loadPushNames()
 	b.groupPath = storePath + ".groups.json"
 	b.loadGroupNames()
+	b.avatarPath = storePath + ".avatars.json"
+	b.loadAvatars()
+	go b.avatarWorker()
 	return b, nil
+}
+
+// isUnreadableStore reports whether a non-empty file exists at path that isn't a
+// plain SQLite database (no "SQLite format 3" header), e.g. an encrypted store.
+func isUnreadableStore(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	hdr := make([]byte, 16)
+	n, _ := f.Read(hdr)
+	return n > 0 && !(n == 16 && string(hdr) == "SQLite format 3\x00")
 }
 
 // handleEvent is whatsmeow's event handler (func(evt any)). Milestone zero only
@@ -281,6 +457,8 @@ func (b *Bridge) handleEvent(evt any) {
 	case *events.LoggedOut:
 		// Session died on the server side — Kotlin should prompt a re-pair.
 		b.emit("LOGGED_OUT", `{"reason":"logged_out"}`)
+	case *events.Picture:
+		b.onPictureChanged(e)
 	default:
 		// e.g. *events.HistorySync, *events.Receipt — visible by type name during
 		// bring-up so we can see traffic without yet decoding it.
@@ -306,9 +484,11 @@ type waMsgContent struct {
 // downloadImage). WhatsApp needs no decryptionKey field — the key lives in the
 // stored ImageMessage handle, looked up by mediaID (= the message ID).
 type waMediaContent struct {
-	Format   string `json:"format"`
-	MimeType string `json:"mimeType"`
-	MediaID  string `json:"mediaID"`
+	Format     string `json:"format"`
+	MimeType   string `json:"mimeType"`
+	MediaID    string `json:"mediaID"`
+	GifLike    *bool  `json:"gifLike,omitempty"`    // VIDEO only: true for GIF-style clips
+	PosterData string `json:"posterData,omitempty"` // VIDEO only: base64 JPEG poster
 }
 type waMessageInfo struct {
 	MessageContent waMsgContent    `json:"messageContent"`
@@ -343,6 +523,7 @@ type waMessage struct {
 	IsMe              bool            `json:"isMe"`
 	FromMe            bool            `json:"fromMe"`
 	ReplyTo           *waReplyTo      `json:"replyTo,omitempty"`
+	AlbumID           string          `json:"albumID,omitempty"`
 }
 
 func (b *Bridge) emitMessage(e *events.Message) {
@@ -362,6 +543,8 @@ func (b *Bridge) emitMessage(e *events.Message) {
 		return
 	}
 	mime, _ := imageHandle(e)
+	vmime, _ := videoHandle(e)
+	amime, _ := audioHandle(e)
 	m := &msgEntry{
 		ID:        e.Info.ID,
 		Text:      body,
@@ -371,6 +554,11 @@ func (b *Bridge) emitMessage(e *events.Message) {
 		Number:    e.Info.Sender.ToNonAD().User,
 		Sender:    e.Info.Sender.String(),
 		ImgMime:   mime,
+		VidMime:   vmime,
+		GifLike:   vmime != "" && videoGifLike(e),
+		VidThumb:  videoThumb(e),
+		AudMime:   amime,
+		AlbumID:   albumID(e),
 		ReplyToID: quotedStanzaID(e.Message),
 	}
 	cv := b.canonicalChatJID(e.Info.Chat).String()
@@ -409,9 +597,83 @@ func (b *Bridge) emitReaction(e *events.Message, rm *waE2E.ReactionMessage) {
 	b.emit("REACTION", string(data))
 }
 
+// videoHandle returns the video's mimetype + downloadable handle, or ("", nil).
+// The watch streams video itself (the phone decodes the file frame by frame), so
+// all this bridge keeps is the handle to fetch the file with.
+func videoHandle(e *events.Message) (string, whatsmeow.DownloadableMessage) {
+	if e.Message == nil {
+		return "", nil
+	}
+	if v := e.Message.GetVideoMessage(); v != nil {
+		mime := v.GetMimetype()
+		if mime == "" {
+			mime = "video/mp4"
+		}
+		return mime, v
+	}
+	return "", nil
+}
+
+// videoGifLike reports whether the message is a video WhatsApp sent as a GIF
+// (GifPlayback set): a short looping clip rather than a regular video.
+func videoGifLike(e *events.Message) bool {
+	if e.Message == nil {
+		return false
+	}
+	return e.Message.GetVideoMessage().GetGifPlayback()
+}
+
+// videoThumb returns the video's embedded JPEG thumbnail as base64, or "".
+func videoThumb(e *events.Message) string {
+	if e.Message == nil {
+		return ""
+	}
+	if t := e.Message.GetVideoMessage().GetJPEGThumbnail(); len(t) > 0 {
+		return base64.StdEncoding.EncodeToString(t)
+	}
+	return ""
+}
+
+// videoKey is where a video's handle lives in the (shared) media store.
+func videoKey(msgID string) string { return "v:" + msgID }
+
+// audioHandle returns the audio's mimetype + downloadable handle, or ("", nil).
+// Covers voice notes (PTT) and audio files alike; the phone plays the file itself.
+func audioHandle(e *events.Message) (string, whatsmeow.DownloadableMessage) {
+	if e.Message == nil {
+		return "", nil
+	}
+	if a := e.Message.GetAudioMessage(); a != nil {
+		mime := a.GetMimetype()
+		if mime == "" {
+			mime = "audio/ogg"
+		}
+		return mime, a
+	}
+	return "", nil
+}
+
+// albumID returns the album parent's message id when the message is one item of a
+// WhatsApp album (MessageContextInfo.MessageAssociation, type MEDIA_ALBUM), else
+// "". The album parent itself (AlbumMessage) has no displayable body, so
+// messagePreview drops it and it never becomes a row.
+func albumID(e *events.Message) string {
+	if e.Message == nil {
+		return ""
+	}
+	a := e.Message.GetMessageContextInfo().GetMessageAssociation()
+	if a.GetAssociationType() != waE2E.MessageAssociation_MEDIA_ALBUM {
+		return ""
+	}
+	return a.GetParentMessageKey().GetID()
+}
+
+// audioKey is where an audio message's handle lives in the (shared) media store.
+func audioKey(msgID string) string { return "a:" + msgID }
+
 // imageHandle returns the image's mimetype + downloadable handle, or ("", nil) if
-// the message is not a (still) image. Video is deliberately NOT treated as an image
-// — it stays a "[Video]" label and is never streamed to the watch image pipeline.
+// the message is not a (still) image. Video is NOT an image: it has its own handle
+// (videoHandle) and goes to the watch's video player, not the image pipeline.
 func imageHandle(e *events.Message) (string, whatsmeow.DownloadableMessage) {
 	if e.Message == nil {
 		return "", nil
@@ -493,6 +755,23 @@ func makeWaMessage(convoID string, m *msgEntry, displayName string) waMessage {
 			MimeType: m.ImgMime,
 			MediaID:  m.ID,
 		}
+	} else if m.VidMime != "" {
+		// mediaID = the message ID; DownloadMediaToFile looks the handle up by it.
+		gifLike := m.GifLike
+		info.MediaContent = &waMediaContent{
+			Format:     "VIDEO",
+			MimeType:   m.VidMime,
+			MediaID:    m.ID,
+			GifLike:    &gifLike,
+			PosterData: m.VidThumb,
+		}
+	} else if m.AudMime != "" {
+		// mediaID = the message ID; DownloadMediaToFile looks the handle up by it.
+		info.MediaContent = &waMediaContent{
+			Format:   "AUDIO",
+			MimeType: m.AudMime,
+			MediaID:  m.ID,
+		}
 	}
 	msg := waMessage{
 		ConversationID: convoID,
@@ -511,6 +790,9 @@ func makeWaMessage(convoID string, m *msgEntry, displayName string) waMessage {
 	}
 	if m.ReplyToID != "" {
 		msg.ReplyTo = &waReplyTo{ID: m.ReplyToID}
+	}
+	if m.AlbumID != "" && (m.ImgMime != "" || m.VidMime != "") {
+		msg.AlbumID = m.AlbumID
 	}
 	return msg
 }
@@ -614,10 +896,6 @@ func (b *Bridge) resolveSenderName(convoID string, m *msgEntry) string {
 	return m.Name
 }
 
-type msgListJSON struct {
-	Messages []waMessage `json:"messages"`
-}
-
 // messagePreview extracts displayable text for a message, labelling media. Returns
 // "" for non-displayable payloads (reactions, receipts, protocol messages).
 func messagePreview(e *events.Message) string {
@@ -680,7 +958,16 @@ func quotedStanzaID(msg *waE2E.Message) string {
 
 // ---- Conversation list: chat index from HistorySync + live messages ----------
 
-// loadChats reads the persisted chat index (best-effort; empty map on any error).
+// chatMsgFileName is the per-chat message file name for a JID. base64url keeps it
+// filesystem-safe and collision-free (JIDs contain '@', '.', and for LIDs ':').
+func chatMsgFileName(jid string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(jid)) + ".json"
+}
+
+// loadChats reads the summary index, then loads each chat's messages from its
+// per-chat file. Best-effort; empty map on any error. Back-compat: an old-format
+// index that still carries inline messages keeps them unless a per-chat file
+// overrides (the next save migrates it to the split layout).
 func (b *Bridge) loadChats() {
 	b.chats = make(map[string]*chatEntry)
 	data, err := os.ReadFile(b.chatsPath)
@@ -688,24 +975,66 @@ func (b *Bridge) loadChats() {
 		return
 	}
 	var list []*chatEntry
-	if json.Unmarshal(data, &list) == nil {
-		for _, e := range list {
-			if e != nil && e.JID != "" {
-				b.chats[e.JID] = e
-			}
+	if json.Unmarshal(data, &list) != nil {
+		return
+	}
+	for _, e := range list {
+		if e == nil || e.JID == "" {
+			continue
 		}
+		if msgs := b.loadChatMessages(e.JID); msgs != nil {
+			e.Messages = msgs
+		}
+		b.chats[e.JID] = e
 	}
 }
 
-// saveChatsLocked writes the chat index. Caller MUST hold chatsMu.
-func (b *Bridge) saveChatsLocked() {
+// loadChatMessages reads one chat's persisted message slice (nil on any error).
+func (b *Bridge) loadChatMessages(jid string) []*msgEntry {
+	data, err := os.ReadFile(b.msgsDir + "/" + chatMsgFileName(jid))
+	if err != nil {
+		return nil
+	}
+	var msgs []*msgEntry
+	if json.Unmarshal(data, &msgs) != nil {
+		return nil
+	}
+	return msgs
+}
+
+// saveIndexLocked writes the conversation index — SUMMARY ROWS ONLY (messages
+// omitted, they live in per-chat files). Small, so it's cheap to rewrite on every
+// live message. Caller MUST hold chatsMu.
+func (b *Bridge) saveIndexLocked() {
 	list := make([]*chatEntry, 0, len(b.chats))
 	for _, e := range b.chats {
-		list = append(list, e)
+		row := *e // shallow copy
+		row.Messages = nil
+		list = append(list, &row)
 	}
 	if data, err := json.Marshal(list); err == nil {
 		_ = os.WriteFile(b.chatsPath, data, 0600)
 	}
+}
+
+// saveChatMessagesLocked writes one chat's full message slice to its per-chat
+// file. Caller MUST hold chatsMu.
+func (b *Bridge) saveChatMessagesLocked(ent *chatEntry) {
+	if ent == nil || ent.JID == "" {
+		return
+	}
+	if data, err := json.Marshal(ent.Messages); err == nil {
+		_ = os.WriteFile(b.msgsDir+"/"+chatMsgFileName(ent.JID), data, 0600)
+	}
+}
+
+// deleteChatMessagesLocked removes a chat's per-chat message file (used when a
+// chat is merged away). Caller MUST hold chatsMu.
+func (b *Bridge) deleteChatMessagesLocked(jid string) {
+	if jid == "" {
+		return
+	}
+	_ = os.Remove(b.msgsDir + "/" + chatMsgFileName(jid))
 }
 
 // ConsolidateLidChats merges any pre-existing @lid 1:1 chat into its phone-JID
@@ -744,11 +1073,17 @@ func (b *Bridge) consolidateLidChatsInternal() {
 			ent.Number = canon.ToNonAD().User
 			b.chats[canonKey] = ent
 		}
+		// Persist the survivor's merged messages under the canonical key and drop
+		// the old LID chat's per-chat file.
+		if surv := b.chats[canonKey]; surv != nil {
+			b.saveChatMessagesLocked(surv)
+		}
+		b.deleteChatMessagesLocked(key)
 		delete(b.chats, key)
 		merged++
 	}
 	if merged > 0 {
-		b.saveChatsLocked()
+		b.saveIndexLocked()
 	}
 	b.chatsMu.Unlock()
 	if merged > 0 {
@@ -879,7 +1214,7 @@ func (b *Bridge) ensureGroupNamesInternal() {
 		// If this won't compile, the error names the right signature/field. ---
 		gi, err := b.client.GetGroupInfo(b.ctx, jid)
 		if err != nil {
-			b.emit("DIAG", fmt.Sprintf("WA-GROUPS %s GetGroupInfo error: %s", jidStr, err.Error()))
+			b.emit("DIAG", fmt.Sprintf("WA-GROUPS %s GetGroupInfo error: %s", jidStr, scrubURLs(err.Error())))
 			continue
 		}
 		if gi == nil || gi.Name == "" {
@@ -890,7 +1225,7 @@ func (b *Bridge) ensureGroupNamesInternal() {
 		b.groupNames[jidStr] = gi.Name
 		b.groupMu.Unlock()
 		named++
-		b.emit("DIAG", fmt.Sprintf("WA-GROUPS %s -> %q", jidStr, gi.Name))
+		b.emit("DIAG", fmt.Sprintf("WA-GROUPS %s named (%d chars)", jidStr, len([]rune(gi.Name))))
 		changed = true
 	}
 	if attempted > 0 {
@@ -934,6 +1269,16 @@ func (b *Bridge) upsertChatFromMessage(e *events.Message) {
 		b.rememberImage(e.Info.ID, dl)
 		b.saveImages()
 	}
+	vmime, vdl := videoHandle(e)
+	if vdl != nil {
+		b.rememberImage(videoKey(e.Info.ID), vdl)
+		b.saveImages()
+	}
+	amime, adl := audioHandle(e)
+	if adl != nil {
+		b.rememberImage(audioKey(e.Info.ID), adl)
+		b.saveImages()
+	}
 	ent.addMsg(&msgEntry{
 		ID:        e.Info.ID,
 		Text:      text,
@@ -943,13 +1288,19 @@ func (b *Bridge) upsertChatFromMessage(e *events.Message) {
 		Number:    e.Info.Sender.ToNonAD().User,
 		Sender:    e.Info.Sender.String(),
 		ImgMime:   mime,
+		VidMime:   vmime,
+		GifLike:   vmime != "" && videoGifLike(e),
+		VidThumb:  videoThumb(e),
+		AudMime:   amime,
+		AlbumID:   albumID(e),
 		ReplyToID: quotedStanzaID(e.Message),
 	})
 	ent.sortAndCap()
 	if ent.Name == "" {
 		ent.Name = ent.Number
 	}
-	b.saveChatsLocked()
+	b.saveChatMessagesLocked(ent)
+	b.saveIndexLocked()
 }
 
 // handleHistorySync folds the post-link history blob into the chat index. This is
@@ -980,6 +1331,8 @@ func (b *Bridge) handleHistorySync(e *events.HistorySync) {
 	if len(convs) == 0 {
 		return
 	}
+	// WA-SYNC accumulators (summarized in one line at the end of this event).
+	var histTotalRaw, histMaxRaw, histOver50 int
 	changed := 0
 	b.chatsMu.Lock()
 	for _, conv := range convs {
@@ -1001,6 +1354,7 @@ func (b *Bridge) handleHistorySync(e *events.HistorySync) {
 			ent = &chatEntry{JID: key, Number: canonJID.ToNonAD().User}
 			b.chats[key] = ent
 		}
+		rawCount := len(conv.GetMessages()) // WA-SYNC: messages this blob delivered
 		for _, hmsg := range conv.GetMessages() {
 			pm, err := b.client.ParseWebMessage(origJID, hmsg.GetMessage())
 			if err != nil || pm == nil {
@@ -1017,6 +1371,14 @@ func (b *Bridge) handleHistorySync(e *events.HistorySync) {
 			if dl != nil {
 				b.rememberImage(pm.Info.ID, dl)
 			}
+			vmime, vdl := videoHandle(pm)
+			if vdl != nil {
+				b.rememberImage(videoKey(pm.Info.ID), vdl)
+			}
+			amime, adl := audioHandle(pm)
+			if adl != nil {
+				b.rememberImage(audioKey(pm.Info.ID), adl)
+			}
 			ent.addMsg(&msgEntry{
 				ID:       pm.Info.ID,
 				Text:     text,
@@ -1026,15 +1388,34 @@ func (b *Bridge) handleHistorySync(e *events.HistorySync) {
 				Number:   pm.Info.Sender.ToNonAD().User,
 				Sender:   pm.Info.Sender.String(),
 				ImgMime:  mime,
+				VidMime:  vmime,
+				GifLike:  vmime != "" && videoGifLike(pm),
+				VidThumb: videoThumb(pm),
+				AudMime:  amime,
+				AlbumID:  albumID(pm),
 			})
 		}
 		ent.sortAndCap()
+		b.saveChatMessagesLocked(ent) // persist this chat's history to its own file
+		histTotalRaw += rawCount
+		if rawCount > histMaxRaw {
+			histMaxRaw = rawCount
+		}
+		if rawCount > maxMsgsPerChat {
+			histOver50++
+		}
 		if ent.Name == "" {
 			ent.Name = ent.Number
 		}
 		changed++
 	}
-	b.saveChatsLocked()
+	// WA-SYNC: one concise line per history-sync event, so we can confirm a FULL
+	// sync fired and how deep it reached after a (re-)link. chatsOverCap flags any
+	// chat whose delivered history exceeded our per-chat cap.
+	b.emit("DIAG", fmt.Sprintf(
+		"WA-SYNC type=%s chats=%d totalRaw=%d maxPerChat=%d chatsOverCap=%d",
+		e.Data.GetSyncType().String(), changed, histTotalRaw, histMaxRaw, histOver50))
+	b.saveIndexLocked()
 	b.chatsMu.Unlock()
 	b.saveImages() // persist any image handles captured from history (batched)
 
@@ -1109,26 +1490,95 @@ func (b *Bridge) ListConversations(count int) (string, error) {
 	return string(data), nil
 }
 
-// FetchMessages returns a chat's stored history as the watch's Google-schema
-// message JSON ({"messages":[...]}), oldest-first, capped at count (0 = all).
-// This is what fills the thread view — openThread on the phone merges + streams it.
-func (b *Bridge) FetchMessages(convoID string, count int) (string, error) {
+// waCursor is the backfill pagination anchor: the (timestamp, id) of a message,
+// so same-second WhatsApp timestamps page deterministically. Carried in the fetch
+// response and passed back on the next (older) fetch.
+type waCursor struct {
+	BeforeTs string `json:"beforeTs"`
+	BeforeID string `json:"beforeId"`
+}
+
+// msgListWithCursorJSON is the fetch response: a page of messages plus the anchor
+// for the next-older page. Cursor is OMITTED when the page reached the oldest
+// stored message (=> phone marks the thread exhausted; clean stop).
+type msgListWithCursorJSON struct {
+	Messages []waMessage `json:"messages"`
+	Cursor   *waCursor   `json:"cursor,omitempty"`
+}
+
+// olderThan reports whether m sorts strictly before the (ts,id) anchor, matching
+// sortAndCap's (TsMicros, ID) ordering.
+func olderThan(m *msgEntry, ts int64, id string) bool {
+	if m.TsMicros != ts {
+		return m.TsMicros < ts
+	}
+	return m.ID < id
+}
+
+// FetchMessages returns a page of a chat's stored history as the watch's
+// Google-schema JSON ({"messages":[...],"cursor":{...}}), oldest-first.
+//   - cursor == ""  -> the newest `count` messages (initial thread open).
+//   - cursor set    -> the `count` messages immediately OLDER than the cursor
+//     anchor (backfill), so the watch can scroll further back.
+//
+// The response "cursor" points at the oldest message in THIS page and is omitted
+// once the page reaches the oldest stored message — that's the clean stop that
+// tells the phone to set backfillExhausted. WhatsApp history is bounded (whatever
+// the last (full) sync delivered), so this pages a fixed local store; there are
+// no network calls here and no runaway.
+func (b *Bridge) FetchMessages(convoID string, count int, cursor string) (string, error) {
 	b.chatsMu.Lock()
 	var msgs []*msgEntry
 	if ent := b.chats[convoID]; ent != nil {
 		msgs = make([]*msgEntry, len(ent.Messages))
-		copy(msgs, ent.Messages)
+		copy(msgs, ent.Messages) // ascending by (ts,id) from sortAndCap
 	}
 	b.chatsMu.Unlock()
 
-	if count > 0 && len(msgs) > count {
-		msgs = msgs[len(msgs)-count:]
+	var sel []*msgEntry
+	if cursor == "" {
+		// Initial open: newest `count`.
+		if count > 0 && len(msgs) > count {
+			sel = msgs[len(msgs)-count:]
+		} else {
+			sel = msgs
+		}
+	} else {
+		var c waCursor
+		if err := json.Unmarshal([]byte(cursor), &c); err != nil {
+			return "", fmt.Errorf("bad cursor: %w", err)
+		}
+		beforeTs, _ := strconv.ParseInt(c.BeforeTs, 10, 64)
+		// Older-than-anchor messages form a prefix of the ascending slice.
+		hi := 0
+		for hi < len(msgs) && olderThan(msgs[hi], beforeTs, c.BeforeID) {
+			hi++
+		}
+		older := msgs[:hi]
+		if count > 0 && len(older) > count {
+			sel = older[len(older)-count:] // newest `count` of the older set
+		} else {
+			sel = older
+		}
 	}
-	out := make([]waMessage, 0, len(msgs))
-	for _, m := range msgs {
+
+	out := make([]waMessage, 0, len(sel))
+	for _, m := range sel {
 		out = append(out, makeWaMessage(convoID, m, b.resolveSenderName(convoID, m)))
 	}
-	data, err := json.Marshal(msgListJSON{Messages: out})
+	resp := msgListWithCursorJSON{Messages: out}
+	// Emit a cursor only if there is older history beyond this page.
+	if len(sel) > 0 && len(msgs) > 0 {
+		oldest := sel[0]
+		globalOldest := msgs[0]
+		if oldest.TsMicros != globalOldest.TsMicros || oldest.ID != globalOldest.ID {
+			resp.Cursor = &waCursor{
+				BeforeTs: strconv.FormatInt(oldest.TsMicros, 10),
+				BeforeID: oldest.ID,
+			}
+		}
+	}
+	data, err := json.Marshal(resp)
 	if err != nil {
 		return "", err
 	}
@@ -1266,15 +1716,61 @@ func (b *Bridge) SendReaction(convoID, targetMsgID, emoji string, targetFromMe b
 	return string(out), nil
 }
 
+// MarkThreadRead marks a thread read on WhatsApp up through msgID. WhatsApp read
+// state is a per-chat high-water mark, so sending a read receipt for the newest
+// message clears the chat's unread state (on the phone and other linked devices).
+// whatsmeow needs the message's SENDER in group chats; we resolve it via the same
+// quotedFor lookup the reaction/reply paths use. In a 1:1 the sender is the chat
+// itself (an empty sender is fine — whatsmeow only requires it for groups). The
+// read-at time is now (when the user actually viewed it), not the message's own
+// timestamp. Mirrors SendReaction's shape/return.
+func (b *Bridge) MarkThreadRead(convoID, msgID string) (string, error) {
+	if b.client == nil {
+		return "", fmt.Errorf("whatsapp not connected")
+	}
+	if msgID == "" {
+		return "", fmt.Errorf("no message id")
+	}
+	to, err := types.ParseJID(convoID)
+	if err != nil {
+		return "", fmt.Errorf("bad jid %q: %w", convoID, err)
+	}
+	// Resolve the sender of msgID (required for groups). quotedFor returns the
+	// sender JID for a known message, or empty if it isn't cached.
+	sender, _ := b.quotedFor(convoID, msgID, to)
+	if to.Server == types.GroupServer && sender.IsEmpty() {
+		// Can't send a valid group read receipt without naming the sender; skip
+		// rather than fire a malformed one. Self-heals when the message re-caches.
+		return "", fmt.Errorf("no sender for group message %q", msgID)
+	}
+	if err := b.client.MarkRead(
+		b.ctx,
+		[]types.MessageID{types.MessageID(msgID)},
+		time.Now(),
+		to,
+		sender,
+	); err != nil {
+		return "", fmt.Errorf("MarkRead: %w", err)
+	}
+	out, _ := json.Marshal(map[string]string{"convoId": convoID, "messageId": msgID})
+	return string(out), nil
+}
+
+// urlRe matches web addresses; scrubURLs keeps only their host, so media links
+// (which carry access tokens) never reach the log or the phone.
+var urlRe = regexp.MustCompile(`(https?://[^/\s"']+)[^\s"']*`)
+
+func scrubURLs(s string) string { return urlRe.ReplaceAllString(s, "$1/…") }
+
 // errJSON wraps an error message in the {"error":...} shape the phone's image
 // path recognizes (it logs + aborts the transfer instead of hanging the watch).
 func errJSON(msg string) string {
-	b, _ := json.Marshal(map[string]string{"error": msg})
+	b, _ := json.Marshal(map[string]string{"error": scrubURLs(msg)})
 	return string(b)
 }
 
 // DownloadImageForWatch fetches+decrypts the image whose handle we stored under
-// msgID, then runs it through the SHARED mirrorbridge encoder (scale + 4bpp
+// msgID, then runs it through the SHARED watchimage encoder (scale + 4bpp
 // palettize) so WhatsApp images render identically to Google's. maxBytes>0 is the
 // enhanced-view heap budget; maxBytes==0 is the small chat-preview box.
 //
@@ -1299,102 +1795,81 @@ func (b *Bridge) DownloadImageForWatch(msgID string, maxW, maxH, maxBytes, quali
 	if err != nil {
 		return errJSON("download: " + err.Error()), nil
 	}
-	out, err := mirrorbridge.EncodeImageForWatch(raw, maxW, maxH, maxBytes, quality)
+	out, err := watchimage.EncodeImageForWatch(raw, maxW, maxH, maxBytes, quality)
 	if err != nil {
 		return errJSON("encode: " + err.Error()), nil
 	}
 	return out, nil
 }
 
-// DumpContacts is a READ-ONLY diagnostic. It reports what whatsmeow's contact
-// store (synced from the phone's address book) holds for the chats we know about,
-// so we can see whether saved contact names are available and how @lid chats
-// behave — BEFORE wiring contact-name resolution. Emits "DIAG" events (the Kotlin
-// sink logs those to the exportable log). Runs at most once per session, off the
-// caller's thread. Changes nothing. TEMPORARY — remove once names are wired.
-func (b *Bridge) DumpContacts() {
-	b.contactsDumpOnce.Do(func() {
-		go b.dumpContactsInternal()
-	})
+// maxVideoBytes refuses anything absurd before pulling it into memory: whatsmeow
+// downloads (and decrypts) the whole file in one go. Applies to video and audio.
+const maxVideoBytes = 64 * 1024 * 1024
+
+// mediaDiag emits a DIAG explaining why DownloadMediaToFile returned -1.
+func (b *Bridge) mediaDiag(kind, msgID, why string) {
+	b.emit("DIAG", fmt.Sprintf(`{"media":%q,"kind":%q,"id":%q}`, scrubURLs(why), kind, msgID))
 }
 
-func (b *Bridge) dumpContactsInternal() {
-	// 1. Whole-store summary + a few samples.
-	all, err := b.client.Store.Contacts.GetAllContacts(b.ctx)
+// DownloadMediaToFile fetches and decrypts a video or audio message to path, for
+// the phone's video streamer and voice-note player. msgID is the message ID (the
+// mediaID the watch was given); the handle is looked up under the video key, then
+// the audio key. Writes the whole playable file or nothing; returns the byte
+// count, or -1 on any failure (with a DIAG saying why).
+func (b *Bridge) DownloadMediaToFile(msgID, path string) int64 {
+	kind := "video"
+	b.imgMu.Lock()
+	enc := b.imgStore[videoKey(msgID)]
+	if enc == "" {
+		kind = "audio"
+		enc = b.imgStore[audioKey(msgID)]
+	}
+	b.imgMu.Unlock()
+	if enc == "" {
+		b.mediaDiag("none", msgID, "no stored handle")
+		return -1
+	}
+	rawProto, err := base64.StdEncoding.DecodeString(enc)
 	if err != nil {
-		b.emit("DIAG", "WA-CONTACTS GetAllContacts error: "+err.Error())
+		b.mediaDiag(kind, msgID, "bad stored handle: "+err.Error())
+		return -1
+	}
+	var dl whatsmeow.DownloadableMessage
+	var size uint64
+	if kind == "video" {
+		v := &waE2E.VideoMessage{}
+		if err := proto.Unmarshal(rawProto, v); err != nil {
+			b.mediaDiag(kind, msgID, "unmarshal: "+err.Error())
+			return -1
+		}
+		dl, size = v, v.GetFileLength()
 	} else {
-		b.emit("DIAG", fmt.Sprintf("WA-CONTACTS store holds %d contacts", len(all)))
-		n := 0
-		for jid, ci := range all {
-			if n >= 8 {
-				break
-			}
-			b.emit("DIAG", fmt.Sprintf(
-				"WA-CONTACTS sample jid=%s server=%s first=%q full=%q push=%q biz=%q",
-				jid.String(), jid.Server, ci.FirstName, ci.FullName, ci.PushName, ci.BusinessName))
-			n++
+		a := &waE2E.AudioMessage{}
+		if err := proto.Unmarshal(rawProto, a); err != nil {
+			b.mediaDiag(kind, msgID, "unmarshal: "+err.Error())
+			return -1
 		}
+		dl, size = a, a.GetFileLength()
 	}
-
-	// 2. Per stored-chat: does a DIRECT GetContact on the chat JID resolve a name?
-	// Expectation: plain @s.whatsapp.net numbers resolve; @lid chats likely come
-	// back found=false — which confirms the real fix needs LID->number resolution.
-	b.chatsMu.Lock()
-	jids := make([]string, 0, len(b.chats))
-	for jid := range b.chats {
-		jids = append(jids, jid)
+	if size > maxVideoBytes {
+		b.mediaDiag(kind, msgID, "too large")
+		return -1
 	}
-	b.chatsMu.Unlock()
-
-	for _, jidStr := range jids {
-		jid, perr := types.ParseJID(jidStr)
-		if perr != nil {
-			b.emit("DIAG", "WA-CONTACTS chat "+jidStr+": bad jid")
-			continue
-		}
-		// What we currently show (push name captured at message time, or number).
-		stored := ""
-		b.chatsMu.Lock()
-		if e := b.chats[jidStr]; e != nil {
-			stored = e.Name
-		}
-		b.chatsMu.Unlock()
-
-		// Direct contact lookup on the chat JID.
-		direct := "GetContact-err"
-		if ci, err := b.client.Store.Contacts.GetContact(b.ctx, jid); err == nil {
-			direct = fmt.Sprintf("found=%t full=%q first=%q push=%q", ci.Found, ci.FullName, ci.FirstName, ci.PushName)
-		} else {
-			direct += ":" + err.Error()
-		}
-
-		// For @lid: resolve to the real phone JID and look THAT up too — the
-		// profile/push name may only be reachable via the resolved number.
-		lidInfo := ""
-		if jid.Server == "lid" {
-			if pn, err := b.client.Store.LIDs.GetPNForLID(b.ctx, jid); err != nil {
-				lidInfo = " | lid->pn ERR:" + err.Error()
-			} else if pn.IsEmpty() {
-				lidInfo = " | lid->pn=<empty>"
-			} else {
-				via := "GetContact-err"
-				if ci, e2 := b.client.Store.Contacts.GetContact(b.ctx, pn); e2 == nil {
-					via = fmt.Sprintf("found=%t full=%q first=%q push=%q", ci.Found, ci.FullName, ci.FirstName, ci.PushName)
-				}
-				lidInfo = fmt.Sprintf(" | lid->pn=%s {%s}", pn.String(), via)
-			}
-		}
-
-		b.emit("DIAG", fmt.Sprintf(
-			"WA-CONTACTS chat %s server=%s stored=%q resolved=%q direct{%s}%s",
-			jidStr, jid.Server, stored, b.resolveName(jid), direct, lidInfo))
+	raw, err := b.client.Download(b.ctx, dl)
+	if err != nil {
+		b.mediaDiag(kind, msgID, "download failed: "+err.Error())
+		return -1
 	}
-	b.pushMu.Lock()
-	npush := len(b.pushNames)
-	b.pushMu.Unlock()
-	b.emit("DIAG", fmt.Sprintf("WA-CONTACTS push-name table holds %d entries", npush))
-	b.emit("DIAG", "WA-CONTACTS dump complete")
+	if len(raw) == 0 || len(raw) > maxVideoBytes {
+		b.mediaDiag(kind, msgID, fmt.Sprintf("bad size %d", len(raw)))
+		return -1
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		_ = os.Remove(path)
+		b.mediaDiag(kind, msgID, "write: "+err.Error())
+		return -1
+	}
+	return int64(len(raw))
 }
 
 // it just connects. Otherwise it sets up QR pairing FIRST (required before
@@ -1404,10 +1879,27 @@ func (b *Bridge) dumpContactsInternal() {
 // main thread anyway (the initial socket connect blocks briefly).
 func (b *Bridge) Connect() error {
 	if b.client.Store.ID != nil {
-		// Already paired — restore session.
+		// Already paired — restore session. Never block here on the version lookup.
+		b.syncWAVersion(0)
 		return b.client.Connect()
 	}
 	return b.startPairingFlow()
+}
+
+// freshClientIfDeleted swaps in a new client on a fresh, unpaired device when the
+// current device record was deleted. A server-side unlink (removing this linked
+// device from the phone) makes whatsmeow emit LoggedOut and delete the device, and
+// it refuses to reuse a deleted device ("invalid use of deleted device"). Only
+// runs while unpaired and disconnected, so nothing else is using the old client.
+func (b *Bridge) freshClientIfDeleted() {
+	if b.client.Store == nil || !b.client.Store.Deleted {
+		return
+	}
+	b.client.Disconnect()
+	client := whatsmeow.NewClient(b.container.NewDevice(), waLog.Noop)
+	client.AddEventHandler(b.handleEvent)
+	b.client = client
+	b.emit("DIAG", "WA-PAIR previous device was deleted; pairing on a fresh one")
 }
 
 // startPairingFlow obtains a fresh QR channel (must be done BEFORE Connect and
@@ -1415,6 +1907,8 @@ func (b *Bridge) Connect() error {
 // for initial pairing and to re-establish the pairing socket if it closed — the
 // socket has a ~160s lifetime and a failed PairPhone attempt can leave it down.
 func (b *Bridge) startPairingFlow() error {
+	b.freshClientIfDeleted()
+	b.syncWAVersion(6 * time.Second)
 	qrChan, err := b.client.GetQRChannel(b.ctx)
 	if err != nil {
 		return fmt.Errorf("get qr channel: %w", err)
@@ -1491,15 +1985,261 @@ func (b *Bridge) IsPaired() bool {
 	return b.client.Store.ID != nil
 }
 
-// SelfNumber returns the logged-in account's phone number — the user part of the
-// device JID (e.g. "15551234567"), no leading "+". Returns "" if no session is
-// paired yet. Read straight from the in-memory store (no I/O), so it's safe to
-// call cheaply; the Kotlin side uses it for the account subtitle.
+// SelfNumber returns the logged-in account's phone number (digits with country
+// code, no device/agent suffix), or "" if no device session exists yet. Sourced
+// from the linked-device JID; used for the account-row label.
 func (b *Bridge) SelfNumber() string {
-	if b.client == nil || b.client.Store.ID == nil {
+	if b.client == nil || b.client.Store == nil || b.client.Store.ID == nil {
 		return ""
 	}
 	return b.client.Store.ID.ToNonAD().User
+}
+
+// ---- Contact and group photos ----------------------------------------------
+
+// avatarEntry is what we know about one chat's photo: its WhatsApp picture id
+// (changes whenever the picture changes), or None when there is no photo or it is
+// hidden from us. At is when it was last confirmed.
+type avatarEntry struct {
+	ID   string `json:"id,omitempty"`
+	None bool   `json:"n,omitempty"`
+	At   int64  `json:"at"`
+}
+
+const (
+	avatarFresh = 24 * time.Hour   // re-check a known photo id after this
+	avatarRetry = 10 * time.Minute // after a failed lookup, wait this long
+	avatarGap   = 500 * time.Millisecond
+)
+
+var errWANotConnected = errors.New("whatsapp not connected")
+
+func (b *Bridge) loadAvatars() {
+	data, err := os.ReadFile(b.avatarPath)
+	if err != nil {
+		return
+	}
+	m := map[string]*avatarEntry{}
+	if json.Unmarshal(data, &m) == nil {
+		b.avatarMu.Lock()
+		for k, v := range m {
+			if v != nil {
+				b.avatars[k] = v
+			}
+		}
+		b.avatarMu.Unlock()
+	}
+}
+
+func (b *Bridge) saveAvatars() {
+	b.avatarMu.Lock()
+	data, err := json.Marshal(b.avatars)
+	b.avatarMu.Unlock()
+	if err == nil {
+		_ = os.WriteFile(b.avatarPath, data, 0600)
+	}
+}
+
+// avatarKey maps a conversation id to the JID to query and the key photos are
+// stored under (the same canonical key the chat list uses).
+func (b *Bridge) avatarKey(convoID string) (types.JID, string, bool) {
+	jid, err := types.ParseJID(convoID)
+	if err != nil || jid.IsEmpty() {
+		return types.JID{}, "", false
+	}
+	jid = b.canonicalChatJID(jid.ToNonAD())
+	return jid, jid.String(), true
+}
+
+func avatarIDFor(key string, e *avatarEntry) string {
+	if e == nil || e.None || e.ID == "" {
+		return ""
+	}
+	return key + "|" + e.ID
+}
+
+// setAvatar records a lookup result; reports whether the chat's photo id changed.
+func (b *Bridge) setAvatar(key, id string) bool {
+	b.avatarMu.Lock()
+	defer b.avatarMu.Unlock()
+	old := b.avatars[key]
+	b.avatars[key] = &avatarEntry{ID: id, None: id == "", At: time.Now().Unix()}
+	delete(b.avatarFailed, key)
+	return old == nil || old.ID != id || old.None != (id == "")
+}
+
+// lookupAvatar asks WhatsApp for a chat's current photo id. No photo, or one
+// hidden from us, is recorded as none; anything else is an error (recorded so the
+// chat isn't asked again for avatarRetry).
+func (b *Bridge) lookupAvatar(jid types.JID, key string) (bool, error) {
+	if b.client == nil || !b.client.IsLoggedIn() {
+		return false, errWANotConnected
+	}
+	ctx, cancel := context.WithTimeout(b.ctx, 15*time.Second)
+	defer cancel()
+	info, err := b.client.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{Preview: true})
+	if errors.Is(err, whatsmeow.ErrProfilePictureNotSet) || errors.Is(err, whatsmeow.ErrProfilePictureUnauthorized) {
+		return b.setAvatar(key, ""), nil
+	}
+	if err == nil && (info == nil || info.ID == "") {
+		err = errors.New("no picture in the answer")
+	}
+	if err != nil {
+		b.avatarMu.Lock()
+		b.avatarFailed[key] = time.Now()
+		b.avatarMu.Unlock()
+		return false, err
+	}
+	return b.setAvatar(key, info.ID), nil
+}
+
+// queueAvatar asks the background worker to look a chat's photo up, unless it is
+// already queued or failed recently.
+func (b *Bridge) queueAvatar(key string) {
+	b.avatarMu.Lock()
+	if b.avatarPending[key] {
+		b.avatarMu.Unlock()
+		return
+	}
+	if t, ok := b.avatarFailed[key]; ok && time.Since(t) < avatarRetry {
+		b.avatarMu.Unlock()
+		return
+	}
+	b.avatarPending[key] = true
+	b.avatarMu.Unlock()
+	select {
+	case b.avatarQueue <- key:
+	default:
+		b.avatarMu.Lock()
+		delete(b.avatarPending, key)
+		b.avatarMu.Unlock()
+	}
+}
+
+// avatarWorker looks queued chats up one at a time, spaced out. When the queue
+// empties after learning a new or changed photo id, it saves and tells Kotlin the
+// list changed, so the next list read carries the photos.
+func (b *Bridge) avatarWorker() {
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case key := <-b.avatarQueue:
+			if jid, err := types.ParseJID(key); err == nil {
+				if changed, _ := b.lookupAvatar(jid, key); changed {
+					b.avatarMu.Lock()
+					b.avatarLearned = true
+					b.avatarMu.Unlock()
+				}
+			}
+			b.avatarMu.Lock()
+			delete(b.avatarPending, key)
+			flush := len(b.avatarQueue) == 0 && b.avatarLearned
+			if flush {
+				b.avatarLearned = false
+			}
+			b.avatarMu.Unlock()
+			if flush {
+				b.saveAvatars()
+				b.emit("CHATS_UPDATED", `{"avatars":1}`)
+			}
+			select {
+			case <-b.ctx.Done():
+				return
+			case <-time.After(avatarGap):
+			}
+		}
+	}
+}
+
+// onPictureChanged applies a live picture change (a contact or group changed or
+// removed its photo) straight to the cache.
+func (b *Bridge) onPictureChanged(e *events.Picture) {
+	_, key, ok := b.avatarKey(e.JID.String())
+	if !ok {
+		return
+	}
+	if !e.Remove && e.PictureID == "" {
+		b.queueAvatar(key)
+		return
+	}
+	id := e.PictureID
+	if e.Remove {
+		id = ""
+	}
+	if b.setAvatar(key, id) {
+		b.saveAvatars()
+		b.emit("CHATS_UPDATED", `{"avatars":1}`)
+	}
+}
+
+// AvatarID names a chat's photo for the phone: "<chat jid>|<picture id>", which
+// changes whenever the picture does, or "" when there is no photo (or it isn't
+// known yet). lookup=false (packing the chat list) never touches the network: it
+// answers from the cache and queues a background lookup for unknown or stale
+// chats. lookup=true (a notification, off the main thread) may ask WhatsApp now.
+func (b *Bridge) AvatarID(convoID string, lookup bool) string {
+	jid, key, ok := b.avatarKey(convoID)
+	if !ok {
+		return ""
+	}
+	b.avatarMu.Lock()
+	e := b.avatars[key]
+	fresh := e != nil && time.Since(time.Unix(e.At, 0)) < avatarFresh
+	b.avatarMu.Unlock()
+	if fresh {
+		return avatarIDFor(key, e)
+	}
+	if !lookup {
+		b.queueAvatar(key)
+		return avatarIDFor(key, e)
+	}
+	if changed, err := b.lookupAvatar(jid, key); err == nil {
+		if changed {
+			b.saveAvatars()
+		}
+		b.avatarMu.Lock()
+		e = b.avatars[key]
+		b.avatarMu.Unlock()
+	}
+	return avatarIDFor(key, e)
+}
+
+// AvatarURL returns a fresh download address for the photo an AvatarID named
+// (WhatsApp's addresses lapse, so one is never kept). "" means there is no photo
+// any more; an error means it can't be had right now (the phone tries again).
+func (b *Bridge) AvatarURL(avatarID string) (string, error) {
+	i := strings.LastIndex(avatarID, "|")
+	if i <= 0 {
+		return "", nil
+	}
+	key := avatarID[:i]
+	jid, err := types.ParseJID(key)
+	if err != nil {
+		return "", nil
+	}
+	if b.client == nil || !b.client.IsLoggedIn() {
+		return "", errWANotConnected
+	}
+	ctx, cancel := context.WithTimeout(b.ctx, 20*time.Second)
+	defer cancel()
+	info, err := b.client.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{Preview: true})
+	if errors.Is(err, whatsmeow.ErrProfilePictureNotSet) || errors.Is(err, whatsmeow.ErrProfilePictureUnauthorized) {
+		if b.setAvatar(key, "") {
+			b.saveAvatars()
+		}
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if info == nil || info.URL == "" {
+		return "", errors.New("no picture address in the answer")
+	}
+	if info.ID != "" && b.setAvatar(key, info.ID) {
+		b.saveAvatars()
+	}
+	return info.URL, nil
 }
 
 // Close disconnects and closes the underlying store DB. Call when tearing the

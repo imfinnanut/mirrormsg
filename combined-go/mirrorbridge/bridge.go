@@ -19,17 +19,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"math"
 	"image"
-	_ "image/gif"
-	_ "image/jpeg"
 	png_pkg "image/png"
 	"os"
 	"sync"
 	"time"
 
+	"fi.mirrormsg/watchimage"
 	"github.com/rs/zerolog"
-	"golang.org/x/image/draw"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
@@ -71,6 +68,40 @@ func newLogger() zerolog.Logger {
 // previously exported session (see ExportSession) and restored, so no pairing
 // is needed. Otherwise a fresh, unpaired client is created and you must pair
 // (StartGaiaPairing or StartQRPairing) before Connect.
+// SetImageConfig forwards the user's Image Quality dials to the shared watchimage
+// encoder. Exposed here (rather than binding the watchimage package directly) so
+// gomobile generates a Kotlin-callable entry point without having to bind
+// watchimage's other exports (which take stdlib interface types it can't bind).
+// Coverages are fractions in (0,1]; caps are a colour COUNT (2/4/16). Called from
+// Kotlin at startup and on every settings change.
+func SetImageConfig(thumbCoverage, fullCoverage float64, thumbCapColors, fullCapColors int, compressFit bool, dither bool, ditherEdge, ditherStrength, ditherIntensity int) {
+	watchimage.SetConfig(thumbCoverage, fullCoverage, thumbCapColors, fullCapColors, compressFit, dither, ditherEdge, ditherStrength, ditherIntensity)
+}
+
+// EncodeImageForWatch is a BRIDGE-INDEPENDENT (package-level) image scaler: it runs
+// the exact same watchimage pipeline as (*Bridge).ProcessInlineImageForWatch, but
+// without needing a *Bridge instance. Exposed for callers that scale images with no
+// Google bridge alive — notably the Beeper image path, which is serverless and has
+// no Go bridge of its own, and previously borrowed (*Bridge).ProcessInlineImageForWatch
+// via Mirror.bridge (null when logged out -> "scaler unavailable"). watchimage is
+// standalone pure Go, so scaling has no reason to depend on the Google bridge's
+// lifecycle. Same input (base64 image bytes) and same JSON output shape as the
+// method form. Mirrors the SetImageConfig pattern so gomobile binds it cleanly.
+//
+// imageDataB64 — base64 JPEG/PNG bytes (e.g. a cached Beeper PNG).
+// maxW, maxH   — bounding box; scaled to fit preserving aspect ratio.
+// Returns JSON: {"w":N,"h":N,"pixels":"<base64>", ...}
+func EncodeImageForWatch(imageDataB64 string, maxW, maxH, maxBytes, quality int) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(imageDataB64)
+	if err != nil {
+		raw, err = base64.RawStdEncoding.DecodeString(imageDataB64)
+		if err != nil {
+			return "", fmt.Errorf("bad imageData base64: %w", err)
+		}
+	}
+	return watchimage.EncodeImageForWatch(raw, maxW, maxH, maxBytes, quality)
+}
+
 func NewBridge(sessionJSON string, sink EventSink) (*Bridge, error) {
 	authData := libgm.NewAuthData()
 	if sessionJSON != "" {
@@ -294,7 +325,9 @@ func (b *Bridge) ListContacts() (string, error) {
 // conversationID  — the conversation ID string (e.g. "1", "488").
 // text            — the message body.
 // participantID   — the defaultOutgoingID from the conversation (e.g. "2").
-//                   This is the "me" participant on the SIM to send from.
+//
+//	This is the "me" participant on the SIM to send from.
+//
 // simTwo          — SIMPayload.Two value from the conversation's simCard (e.g. 2).
 // simNumber       — SIMPayload.SIMNumber from the conversation's simCard (e.g. 2).
 //
@@ -399,7 +432,19 @@ func (b *Bridge) SendReaction(targetMsgID, emoji string, remove bool) (string, e
 	out, _ := json.Marshal(map[string]string{"messageId": targetMsgID})
 	return string(out), nil
 }
-//
+
+// MarkRead marks the conversation read UP THROUGH messageID: libgm sends a read
+// receipt to Google Messages, clearing the thread's unread state on the source
+// (not just dismissing a local notification). Mirrors the SendReaction shape:
+// returns a small ok-JSON, or an error the caller surfaces.
+func (b *Bridge) MarkRead(conversationID, messageID string) (string, error) {
+	if err := b.client.MarkRead(conversationID, messageID); err != nil {
+		return "", err
+	}
+	out, _ := json.Marshal(map[string]string{"conversationId": conversationID, "messageId": messageID})
+	return string(out), nil
+}
+
 // VERIFY: ContactNumber field population. The bridge derives Number /
 // FormattedNumber / MysteriousInt via libphonenumber; here we set the obvious
 // ones. Confirm against msgconv if creation fails.
@@ -426,20 +471,8 @@ func (b *Bridge) StartNewConversation(phoneNumber string) (string, error) {
 
 // ---- Image download for watch -----------------------------------------
 
-
 func pngEncodeImg(w *bytes.Buffer, img image.Image) error {
 	return png_pkg.Encode(w, img)
-}
-
-// WatchImageResult is the JSON returned by DownloadImageForWatch.
-// Pixels is a base64-encoded byte slice: one byte per pixel in GColor8 format
-// (0xC0 | r2<<4 | g2<<2 | b2), row-major, top-to-bottom, left-to-right.
-type WatchImageResult struct {
-	Width   int    `json:"w"`
-	Height  int    `json:"h"`
-	Pixels  string `json:"pixels"`  // base64: 8bpp GColor8 bytes, or 4bpp packed indices
-	Format  int    `json:"fmt"`     // 0 = 8bpp full color, 1 = 4bpp 16-color palette
-	Palette string `json:"palette"` // base64 of up to 16 GColor8 bytes (4bpp only)
 }
 
 // DownloadImageForWatch downloads, decrypts, scales, and quantizes a media
@@ -466,7 +499,7 @@ func (b *Bridge) DownloadImageForWatch(mediaID, decryptionKeyB64 string, maxW, m
 	if err != nil {
 		return "", fmt.Errorf("DownloadMedia: %w", err)
 	}
-	return EncodeImageForWatch(rawBytes, maxW, maxH, maxBytes, quality)
+	return watchimage.EncodeImageForWatch(rawBytes, maxW, maxH, maxBytes, quality)
 }
 
 // ProcessInlineImageForWatch handles images that arrive INLINE in the message
@@ -485,199 +518,5 @@ func (b *Bridge) ProcessInlineImageForWatch(mediaDataB64 string, maxW, maxH, max
 			return "", fmt.Errorf("bad mediaData base64: %w", err)
 		}
 	}
-	return EncodeImageForWatch(raw, maxW, maxH, maxBytes, quality)
-}
-
-// EncodeImageForWatch decodes raw image bytes, scales to fit, and quantizes to
-// Pebble GColor8 (one byte/pixel). Shared by the download and inline paths.
-// gcolorDist: squared distance between two GColor8 bytes in 2-bit RGB space.
-func gcolorDist(a, b byte) int {
-	ar := int((a >> 4) & 3); ag := int((a >> 2) & 3); ab := int(a & 3)
-	br := int((b >> 4) & 3); bg := int((b >> 2) & 3); bb := int(b & 3)
-	dr := ar - br; dg := ag - bg; db := ab - bb
-	return dr*dr + dg*dg + db*db
-}
-
-// buildPalette16 picks up to 16 palette entries: the most frequently occurring
-// GColor8 values in the image (a cheap, effective quantization for photos).
-// Always returns exactly 16 entries (padded by repeating the last if needed).
-func buildPalette16(g8 []byte) []byte {
-	counts := make(map[byte]int, 64)
-	for _, v := range g8 {
-		counts[v]++
-	}
-	// Collect distinct values and sort by frequency desc.
-	type vc struct {
-		v byte
-		c int
-	}
-	arr := make([]vc, 0, len(counts))
-	for v, c := range counts {
-		arr = append(arr, vc{v, c})
-	}
-	// Simple selection sort for the top 16 (len is <=64, cheap).
-	for i := 0; i < len(arr) && i < 16; i++ {
-		mx := i
-		for j := i + 1; j < len(arr); j++ {
-			if arr[j].c > arr[mx].c {
-				mx = j
-			}
-		}
-		arr[i], arr[mx] = arr[mx], arr[i]
-	}
-	pal := make([]byte, 16)
-	n := len(arr)
-	if n > 16 {
-		n = 16
-	}
-	for i := 0; i < n; i++ {
-		pal[i] = arr[i].v
-	}
-	// Pad any unused slots with the last real color (or opaque black).
-	last := byte(0xC0)
-	if n > 0 {
-		last = arr[n-1].v
-	}
-	for i := n; i < 16; i++ {
-		pal[i] = last
-	}
-	return pal
-}
-
-// EncodeImageForWatch decodes raw image bytes, scales, and quantizes to Pebble
-// GColor8 (one byte/pixel). Two sizing modes:
-//   - maxBytes > 0  (enhanced view): cap WIDTH at maxW, height UNLIMITED, then
-//     shrink uniformly only if w*h exceeds the watch's reported heap budget.
-//     maxH is ignored in this mode.
-//   - maxBytes == 0 (chat preview):  classic fit-in-maxW-by-maxH box.
-func EncodeImageForWatch(rawBytes []byte, maxW, maxH, maxBytes, quality int) (string, error) {
-	// Decode image.
-	src, _, err := image.Decode(bytes.NewReader(rawBytes))
-	if err != nil {
-		return "", fmt.Errorf("image.Decode: %w", err)
-	}
-
-	srcB := src.Bounds()
-	srcW := srcB.Dx()
-	srcH := srcB.Dy()
-	var dstW, dstH int
-
-	// 16-color (4bpp) packs 2 pixels per byte, so a given heap budget fits
-	// TWICE as many pixels. bytesPerPixel reflects that for the budget math.
-	bytesPerPixelNum := 1 // numerator
-	bytesPerPixelDen := 1 // denominator (4bpp -> 1/2 byte per pixel)
-	if quality == 1 {
-		bytesPerPixelDen = 2
-	}
-
-	if maxBytes > 0 {
-		// Memory-driven (enhanced). pixels that fit = maxBytes / bytesPerPixel.
-		// Step 1: width cap only (no horizontal scroll); height stays free.
-		scale := 1.0
-		if srcW > maxW {
-			scale = float64(maxW) / float64(srcW)
-		}
-		dstW = int(float64(srcW)*scale + 0.5)
-		dstH = int(float64(srcH)*scale + 0.5)
-		// Step 2: byte-budget cap. bytes = pixels * num/den. Solve pixels<=budget.
-		maxPixels := maxBytes * bytesPerPixelDen / bytesPerPixelNum
-		if dstW*dstH > maxPixels {
-			k := math.Sqrt(float64(maxPixels) / float64(dstW*dstH))
-			dstW = int(float64(dstW)*k + 0.5)
-			dstH = int(float64(dstH)*k + 0.5)
-		}
-	} else {
-		// Classic box fit (chat preview): fit within maxW x maxH, keep AR.
-		scale := 1.0
-		if float64(srcW)/float64(maxW) > float64(srcH)/float64(maxH) {
-			scale = float64(maxW) / float64(srcW)
-		} else {
-			scale = float64(maxH) / float64(srcH)
-		}
-		if scale > 1.0 {
-			scale = 1.0
-		}
-		dstW = int(float64(srcW)*scale + 0.5)
-		dstH = int(float64(srcH)*scale + 0.5)
-	}
-	if dstW < 1 {
-		dstW = 1
-	}
-	if dstH < 1 {
-		dstH = 1
-	}
-
-	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
-	draw.BiLinear.Scale(dst, dst.Bounds(), src, src.Bounds(), draw.Over, nil)
-
-	// First quantize every pixel to a Pebble GColor8 byte (0b11rrggbb).
-	g8 := make([]byte, dstW*dstH)
-	for y := 0; y < dstH; y++ {
-		for x := 0; x < dstW; x++ {
-			r, g, bb, _ := dst.At(x, y).RGBA()
-			r2 := uint8(r >> 14)
-			g2 := uint8(g >> 14)
-			b2 := uint8(bb >> 14)
-			g8[y*dstW+x] = 0xC0 | (r2 << 4) | (g2 << 2) | b2
-		}
-	}
-
-	var result WatchImageResult
-	if quality == 1 {
-		// 16-color (4bpp): build a 16-entry palette of the most common GColor8
-		// values, map each pixel to the nearest palette index, pack 2/byte.
-		palette := buildPalette16(g8)
-		// Map each GColor8 value -> nearest palette index (cache by value).
-		idxCache := make(map[byte]uint8, 64)
-		nibbleFor := func(v byte) uint8 {
-			if i, ok := idxCache[v]; ok {
-				return i
-			}
-			best := 0
-			bestD := 1 << 30
-			for i, pv := range palette {
-				d := gcolorDist(v, pv)
-				if d < bestD {
-					bestD = d
-					best = i
-				}
-			}
-			idxCache[v] = uint8(best)
-			return uint8(best)
-		}
-		// Pack: each byte holds two 4-bit indices (high nibble = even x).
-		rowBytes := (dstW + 1) / 2
-		packed := make([]byte, rowBytes*dstH)
-		for y := 0; y < dstH; y++ {
-			for x := 0; x < dstW; x++ {
-				ni := nibbleFor(g8[y*dstW+x])
-				bi := y*rowBytes + x/2
-				if x%2 == 0 {
-					packed[bi] |= ni << 4
-				} else {
-					packed[bi] |= ni & 0x0F
-				}
-			}
-		}
-		result = WatchImageResult{
-			Width:   dstW,
-			Height:  dstH,
-			Pixels:  base64.StdEncoding.EncodeToString(packed),
-			Format:  1,
-			Palette: base64.StdEncoding.EncodeToString(palette),
-		}
-	} else {
-		// Full color (8bpp): the GColor8 bytes are the pixels.
-		result = WatchImageResult{
-			Width:  dstW,
-			Height: dstH,
-			Pixels: base64.StdEncoding.EncodeToString(g8),
-			Format: 0,
-		}
-	}
-	out, err := json.Marshal(result)
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
+	return watchimage.EncodeImageForWatch(raw, maxW, maxH, maxBytes, quality)
 }

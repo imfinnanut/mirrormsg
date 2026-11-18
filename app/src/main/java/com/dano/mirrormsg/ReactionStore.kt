@@ -21,6 +21,18 @@ package com.dano.mirrormsg
  * The watch reads one value per message via [summaryFor], which yields the
  * field-7 wire string the chat renderer packs.
  */
+/**
+ * A network that can take back the user's reaction [emoji] (step 101: sent again from the
+ * watch, it unsends; a like pressed again, it unlikes). Same answer as sendReaction:
+ * {"messageId":…} when done. Networks without it keep a reaction sent again as an add.
+ */
+interface ReactionRemover {
+    fun removeReaction(conversationId: String, targetMessageId: String,
+                       targetFromMe: Boolean, emoji: String): String
+}
+// (A network opts in to "the same reaction again takes it back" by implementing it: one
+// whose empty reaction removes the user's can answer with sendReaction(…, "").)
+
 object ReactionStore {
 
     // messageId -> ordered (actorKey -> emoji). Outer map is insertion-ordered so
@@ -48,6 +60,12 @@ object ReactionStore {
     // networks that don't send snapshots simply never populate it and keep using the
     // per-id merge path. Persisted so the corrected state survives a restart.
     private val authByStamp = HashMap<String, LinkedHashMap<String, String>>()
+
+    // messageId -> the reaction the user sent it from the watch (step 101): what makes the
+    // same one sent again take it back, and the watch show the badge as the user's own
+    // (magenta). Kept apart from byMessage, whose sets the networks' echoes, snapshots and
+    // counts replace wholesale. Oldest first; persisted ("o").
+    private val sentByMe = LinkedHashMap<String, String>()
     private val lock = Any()
 
     // Max distinct emoji shown in a badge; the total count still reflects all.
@@ -110,6 +128,15 @@ object ReactionStore {
                         authByStamp[stamp] = inner
                     }
                 }
+                val own = root.optJSONObject("o")
+                if (own != null) {
+                    val oi = own.keys()
+                    while (oi.hasNext()) {
+                        val mid = oi.next()
+                        val e = own.optString(mid)
+                        if (e.isNotEmpty()) sentByMe[mid] = e
+                    }
+                }
             } catch (_: Exception) {
             }
         }
@@ -143,6 +170,9 @@ object ReactionStore {
                 a2.put(stamp, a)
             }
             root.put("a", a2)
+            val o = org.json.JSONObject()
+            for ((mid, e) in sentByMe) o.put(mid, e)
+            root.put("o", o)
             root.toString()
         }
         try {
@@ -403,6 +433,25 @@ object ReactionStore {
         return ""
     }
 
+    /** The reaction the user sent message [messageId] from the watch, if it's still theirs (step 101). */
+    fun sentMine(messageId: String): String? {
+        if (messageId.isEmpty()) return null
+        ensureLoaded()
+        return synchronized(lock) { sentByMe[messageId] }
+    }
+
+    /** The user's reaction sent to [messageId] from the watch ([emoji]), or taken back (null). */
+    fun setSentMine(messageId: String, emoji: String?) {
+        if (messageId.isEmpty()) return
+        ensureLoaded()
+        synchronized(lock) {
+            sentByMe.remove(messageId)
+            if (!emoji.isNullOrEmpty()) sentByMe[messageId] = emoji
+            while (sentByMe.size > MAX_MESSAGES) sentByMe.remove(sentByMe.keys.iterator().next())
+        }
+        scheduleSave()
+    }
+
     /**
      * DIAGNOSTIC ONLY: alias-map size + the normalized stamp computed for [ts] in
      * [thread] and whether an alias exists at that key. Reveals whether the alias is
@@ -415,7 +464,7 @@ object ReactionStore {
 
     /** Drop all stored reactions (e.g. on logout / full resync). */
     fun clear() {
-        synchronized(lock) { byMessage.clear(); aliasByStamp.clear(); authByStamp.clear() }
+        synchronized(lock) { byMessage.clear(); aliasByStamp.clear(); authByStamp.clear(); sentByMe.clear() }
         scheduleSave()
     }
 
