@@ -46,17 +46,7 @@ jobs:
            // libgm bumps, re-check the spots marked "VERIFY" below against the new source.
            package mirrorbridge
            
-          @@ -20,7 +20,8 @@
-           	"encoding/json"
-           	"fmt"
-           	"image"
-          -	png_pkg "image/png"
-          +	png_pkg "image/png"
-          +	"io"
-           	"os"
-           	"sync"
-           	"time"
-          @@ -32,7 +33,8 @@
+          @@ -32,7 +32,8 @@
            
            	"go.mau.fi/mautrix-gmessages/pkg/libgm"
            	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
@@ -66,7 +56,7 @@ jobs:
            )
            
            // EventSink is implemented on the Kotlin side. The Go event loop calls OnEvent
-          @@ -111,7 +113,12 @@
+          @@ -111,7 +112,12 @@
            			return nil, fmt.Errorf("failed to restore session: %w", err)
            		}
            	}
@@ -80,7 +70,7 @@ jobs:
            	ctx, cancel := context.WithCancel(context.Background())
            	b := &Bridge{
            		client: client,
-          @@ -157,7 +164,7 @@
+          @@ -157,7 +163,7 @@
            // see it in Logcat and decide whether to handle it.
            //
            // The event types here are taken straight from libgm's event_handler.go
@@ -89,7 +79,7 @@ jobs:
            // updates as *gmproto.Conversation, etc.
            func (b *Bridge) handleEvent(evt any) {
            	switch e := evt.(type) {
-          @@ -228,7 +235,7 @@
+          @@ -228,7 +234,7 @@
            		b.emit("PAIRED", data)
            	}
            	b.client.PairCallback.Store(&cb)
@@ -98,7 +88,7 @@ jobs:
            }
            
            // ---- Connection ------------------------------------------------------------
-          @@ -237,7 +244,7 @@
+          @@ -237,7 +243,7 @@
            // arriving as MESSAGE events on the sink. Blocking network call — keep it off
            // the main thread.
            func (b *Bridge) Connect() error {
@@ -107,7 +97,7 @@ jobs:
            }
            
            // Disconnect stops the long-poll and cancels in-flight pairing.
-          @@ -270,7 +277,10 @@
+          @@ -270,7 +276,10 @@
            func (b *Bridge) ListConversations(count int) (string, error) {
            	// VERIFY: ListConversationsRequest_INBOX is the expected inbox folder enum;
            	// confirm the enum value name if this fails to compile.
@@ -119,7 +109,7 @@ jobs:
            	if err != nil {
            		return "", err
            	}
-          @@ -293,7 +303,7 @@
+          @@ -293,7 +302,7 @@
            			return "", fmt.Errorf("invalid cursor JSON: %w", err)
            		}
            	}
@@ -128,7 +118,7 @@ jobs:
            	if err != nil {
            		return "", err
            	}
-          @@ -307,7 +317,7 @@
+          @@ -307,7 +316,7 @@
            // ListContacts returns the contact list as JSON (used to label conversations
            // and to power a contact picker on the watch).
            func (b *Bridge) ListContacts() (string, error) {
@@ -137,7 +127,7 @@ jobs:
            	if err != nil {
            		return "", err
            	}
-          @@ -357,7 +367,7 @@
+          @@ -357,7 +366,7 @@
            			}},
            		},
            	}
@@ -146,7 +136,7 @@ jobs:
            	if err != nil {
            		return "", err
            	}
-          @@ -393,7 +403,7 @@
+          @@ -393,7 +402,7 @@
            		},
            		Reply: &gmproto.ReplyPayload{MessageID: targetMsgID},
            	}
@@ -155,7 +145,7 @@ jobs:
            	if err != nil {
            		return "", err
            	}
-          @@ -418,7 +428,7 @@
+          @@ -418,7 +427,7 @@
            	if remove {
            		action = gmproto.SendReactionRequest_REMOVE
            	}
@@ -164,7 +154,7 @@ jobs:
            		MessageID:    targetMsgID,
            		ReactionData: gmproto.MakeReactionData(emoji),
            		Action:       action,
-          @@ -438,7 +448,7 @@
+          @@ -438,7 +447,7 @@
            // (not just dismissing a local notification). Mirrors the SendReaction shape:
            // returns a small ok-JSON, or an error the caller surfaces.
            func (b *Bridge) MarkRead(conversationID, messageID string) (string, error) {
@@ -173,7 +163,7 @@ jobs:
            		return "", err
            	}
            	out, _ := json.Marshal(map[string]string{"conversationId": conversationID, "messageId": messageID})
-          @@ -458,7 +468,7 @@
+          @@ -458,7 +467,7 @@
            			},
            		},
            	}
@@ -182,27 +172,81 @@ jobs:
            	if err != nil {
            		return "", err
            	}
-          @@ -495,11 +505,16 @@
+          @@ -495,7 +504,7 @@
            	}
            
            	// Download and decrypt.
           -	rawBytes, err := b.client.DownloadMedia(mediaID, key)
-          +	media, err := b.client.DownloadMedia(context.Background(), mediaID, key)
+          +	rawBytes, err := b.downloadMedia(mediaID, key)
            	if err != nil {
            		return "", fmt.Errorf("DownloadMedia: %w", err)
            	}
-          -	return watchimage.EncodeImageForWatch(rawBytes, maxW, maxH, maxBytes, quality)
-          +	defer media.Close()
-          +	rawBytes, err := io.ReadAll(media)
-          +	if err != nil {
-          +		return "", fmt.Errorf("reading media: %w", err)
-          +	}
-          +	return watchimage.EncodeImageForWatch(rawBytes, maxW, maxH, maxBytes, quality)
-           }
+          diff --git a/combined-go/mirrorbridge/bridge_avatar.go b/combined-go/mirrorbridge/bridge_avatar.go
+          --- a/combined-go/mirrorbridge/bridge_avatar.go
+          +++ b/combined-go/mirrorbridge/bridge_avatar.go
+          @@ -14,7 +14,7 @@
            
-           // ProcessInlineImageForWatch handles images that arrive INLINE in the message
+           // ParticipantThumbnail returns a participant's photo, or nothing when there's none.
+           func (b *Bridge) ParticipantThumbnail(participantID string) ([]byte, error) {
+          -	resp, err := b.client.GetParticipantThumbnail(participantID)
+          +	resp, err := b.client.GetParticipantThumbnail(context.Background(), participantID)
+           	if err != nil {
+           		return nil, err
+           	}
+          diff --git a/combined-go/mirrorbridge/bridge_media.go b/combined-go/mirrorbridge/bridge_media.go
+          --- a/combined-go/mirrorbridge/bridge_media.go
+          +++ b/combined-go/mirrorbridge/bridge_media.go
+          @@ -1,13 +1,24 @@
+           package mirrorbridge
+           
+          -import (
+          +import (
+          +	"context"
+           	"encoding/base64"
+          -	"fmt"
+          +	"fmt"
+          +	"io"
+           
+           	"fi.mirrormsg/mediaroute"
+           )
+           
+          -// ---- unified media entry point ---------------------------------------------
+          +func (b *Bridge) downloadMedia(mediaID string, key []byte) ([]byte, error) {
+          +	media, err := b.client.DownloadMedia(context.Background(), mediaID, key)
+          +	if err != nil {
+          +		return nil, err
+          +	}
+          +	defer media.Close()
+          +	return io.ReadAll(media)
+          +}
+          +
+          +// ---- unified media entry point ---------------------------------------------
+           //
+           // These download once and hand the bytes to mediaroute, which encodes them and
+           // wraps the reply. Only the fetch is Google-specific and lives here; every other
+          @@ -23,7 +34,7 @@
+           			return "", fmt.Errorf("bad decryptionKey base64: %w", err)
+           		}
+           	}
+          -	raw, err := b.client.DownloadMedia(mediaID, key)
+          +	raw, err := b.downloadMedia(mediaID, key)
+           	if err != nil {
+           		return "", fmt.Errorf("DownloadMedia: %w", err)
+           	}
+          diff --git a/combined-go/mirrorbridge/bridge_video.go b/combined-go/mirrorbridge/bridge_video.go
+          --- a/combined-go/mirrorbridge/bridge_video.go
+          +++ b/combined-go/mirrorbridge/bridge_video.go
+          @@ -20,7 +20,7 @@
+           			return 0, fmt.Errorf("bad decryptionKey base64: %w", err)
+           		}
+           	}
+          -	raw, err := b.client.DownloadMedia(mediaID, key)
+          +	raw, err := b.downloadMedia(mediaID, key)
+           	if err != nil {
+           		return 0, fmt.Errorf("DownloadMedia: %w", err)
+           	}
           LIBGM_PATCH
-          gofmt -w combined-go/mirrorbridge/bridge.go
+          gofmt -w combined-go/mirrorbridge/bridge*.go
       - name: Rebuild native bridges
         shell: bash
         run: |
