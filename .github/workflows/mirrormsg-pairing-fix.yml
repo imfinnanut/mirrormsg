@@ -1,0 +1,64 @@
+name: MirrorMsg pairing fix (test APK)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: combined-go/go.mod
+          cache-dependency-path: combined-go/go.sum
+      - name: Upgrade Google Messages library
+        working-directory: combined-go
+        run: |
+          go get go.mau.fi/mautrix-gmessages@v0.2611.0
+          go mod tidy
+          test "$(go list -m -f '{{.Version}}' go.mau.fi/mautrix-gmessages)" = v0.2611.0
+          git diff -- go.mod go.sum
+      - name: Rebuild native bridges
+        shell: bash
+        run: |
+          mobile_version=$(cd combined-go && go list -m -f '{{.Version}}' golang.org/x/mobile)
+          go install "golang.org/x/mobile/cmd/gomobile@$mobile_version" "golang.org/x/mobile/cmd/gobind@$mobile_version"
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          test -d "$ANDROID_NDK_HOME"
+          sh combined-go/bind.sh
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Compile Android APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --stacktrace
+      - name: Verify configuration and APK signature
+        shell: bash
+        run: |
+          build_tools=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
+          for apk in app/build/outputs/apk/debug/*.apk; do
+            "$build_tools/apksigner" verify --verbose "$apk"
+            "$build_tools/aapt" dump badging "$apk" | sed -n '/^package:/p; /^native-code:/p'
+            unzip -Z1 "$apk" | grep '^lib/arm64-v8a/libgojni\.so$'
+            sha256sum "$apk"
+          done
+      - name: Upload test APK and dependency changes
+        uses: actions/upload-artifact@v4
+        with:
+          name: MirrorMsg-pairing-fix
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            combined-go/go.mod
+            combined-go/go.sum
+          if-no-files-found: error
