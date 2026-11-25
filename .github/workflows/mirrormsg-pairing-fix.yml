@@ -2,6 +2,319 @@ name: MirrorMsg pairing fix (test APK)
 
 on:
   workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful run to repackage without rebuilding
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: inputs.source_run_id == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: combined-go/go.mod
+          cache-dependency-path: combined-go/go.sum
+      - name: Upgrade Google Messages library
+        working-directory: combined-go
+        run: |
+          go get go.mau.fi/mautrix-gmessages@v0.2611.0
+          go mod tidy
+          test "$(go list -m -f '{{.Version}}' go.mau.fi/mautrix-gmessages)" = v0.2611.0
+          git diff -- go.mod go.sum
+      - name: Adapt the bridge to libgm v0.2611.0
+        shell: bash
+        run: |
+          git apply <<'LIBGM_PATCH'
+          diff --git a/combined-go/mirrorbridge/bridge.go b/combined-go/mirrorbridge/bridge.go
+          --- a/combined-go/mirrorbridge/bridge.go
+          +++ b/combined-go/mirrorbridge/bridge.go
+          @@ -9,7 +9,7 @@
+           // JNI boundary cleanly. So everything that touches gmproto / libgm internals
+           // stays on the Go side of this file; Kotlin only ever sees JSON strings.
+           //
+          -// Pinned against libgm v0.2605.0 (May 2026). If Google changes the protocol and
+          +// Pinned against libgm v0.2611.0 (November 2026). If Google changes the protocol and
+           // libgm bumps, re-check the spots marked "VERIFY" below against the new source.
+           package mirrorbridge
+           
+          @@ -32,7 +32,8 @@
+           
+           	"go.mau.fi/mautrix-gmessages/pkg/libgm"
+           	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
+          -	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+          +	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+          +	"go.mau.fi/util/exhttp"
+           )
+           
+           // EventSink is implemented on the Kotlin side. The Go event loop calls OnEvent
+          @@ -111,7 +112,12 @@
+           			return nil, fmt.Errorf("failed to restore session: %w", err)
+           		}
+           	}
+          -	client := libgm.NewClient(authData, nil, newLogger())
+          +	httpSettings := exhttp.ClientSettings{
+          +		GlobalTimeout:         2 * time.Minute,
+          +		TLSHandshakeTimeout:   10 * time.Second,
+          +		ResponseHeaderTimeout: 20 * time.Second,
+          +	}.WithDialTimeout(10 * time.Second)
+          +	client := libgm.NewClient(authData, nil, newLogger(), httpSettings)
+           	ctx, cancel := context.WithCancel(context.Background())
+           	b := &Bridge{
+           		client: client,
+          @@ -157,7 +163,7 @@
+           // see it in Logcat and decide whether to handle it.
+           //
+           // The event types here are taken straight from libgm's event_handler.go
+          -// (v0.2605.0): incoming messages arrive as *libgm.WrappedMessage, conversation
+          +// (v0.2611.0): incoming messages arrive as *libgm.WrappedMessage, conversation
+           // updates as *gmproto.Conversation, etc.
+           func (b *Bridge) handleEvent(evt any) {
+           	switch e := evt.(type) {
+          @@ -228,7 +234,7 @@
+           		b.emit("PAIRED", data)
+           	}
+           	b.client.PairCallback.Store(&cb)
+          -	return b.client.StartLogin()
+          +	return b.client.StartLogin(context.Background())
+           }
+           
+           // ---- Connection ------------------------------------------------------------
+          @@ -237,7 +243,7 @@
+           // arriving as MESSAGE events on the sink. Blocking network call — keep it off
+           // the main thread.
+           func (b *Bridge) Connect() error {
+          -	return b.client.Connect()
+          +	return b.client.Connect(context.Background())
+           }
+           
+           // Disconnect stops the long-poll and cancels in-flight pairing.
+          @@ -270,7 +276,10 @@
+           func (b *Bridge) ListConversations(count int) (string, error) {
+           	// VERIFY: ListConversationsRequest_INBOX is the expected inbox folder enum;
+           	// confirm the enum value name if this fails to compile.
+          -	resp, err := b.client.ListConversations(count, gmproto.ListConversationsRequest_INBOX)
+          +	resp, err := b.client.ListConversations(context.Background(), &gmproto.ListConversationsRequest{
+          +		Count:  int64(count),
+          +		Folder: gmproto.ListConversationsRequest_INBOX,
+          +	})
+           	if err != nil {
+           		return "", err
+           	}
+          @@ -293,7 +302,7 @@
+           			return "", fmt.Errorf("invalid cursor JSON: %w", err)
+           		}
+           	}
+          -	resp, err := b.client.FetchMessages(conversationID, count, cursor)
+          +	resp, err := b.client.FetchMessages(context.Background(), conversationID, count, cursor)
+           	if err != nil {
+           		return "", err
+           	}
+          @@ -307,7 +316,7 @@
+           // ListContacts returns the contact list as JSON (used to label conversations
+           // and to power a contact picker on the watch).
+           func (b *Bridge) ListContacts() (string, error) {
+          -	resp, err := b.client.ListContacts()
+          +	resp, err := b.client.ListContacts(context.Background())
+           	if err != nil {
+           		return "", err
+           	}
+          @@ -357,7 +366,7 @@
+           			}},
+           		},
+           	}
+          -	resp, err := b.client.SendMessage(req)
+          +	resp, err := b.client.SendMessage(context.Background(), req)
+           	if err != nil {
+           		return "", err
+           	}
+          @@ -393,7 +402,7 @@
+           		},
+           		Reply: &gmproto.ReplyPayload{MessageID: targetMsgID},
+           	}
+          -	resp, err := b.client.SendMessage(req)
+          +	resp, err := b.client.SendMessage(context.Background(), req)
+           	if err != nil {
+           		return "", err
+           	}
+          @@ -418,7 +427,7 @@
+           	if remove {
+           		action = gmproto.SendReactionRequest_REMOVE
+           	}
+          -	resp, err := b.client.SendReaction(&gmproto.SendReactionRequest{
+          +	resp, err := b.client.SendReaction(context.Background(), &gmproto.SendReactionRequest{
+           		MessageID:    targetMsgID,
+           		ReactionData: gmproto.MakeReactionData(emoji),
+           		Action:       action,
+          @@ -438,7 +447,7 @@
+           // (not just dismissing a local notification). Mirrors the SendReaction shape:
+           // returns a small ok-JSON, or an error the caller surfaces.
+           func (b *Bridge) MarkRead(conversationID, messageID string) (string, error) {
+          -	if err := b.client.MarkRead(conversationID, messageID); err != nil {
+          +	if err := b.client.MarkRead(context.Background(), conversationID, messageID); err != nil {
+           		return "", err
+           	}
+           	out, _ := json.Marshal(map[string]string{"conversationId": conversationID, "messageId": messageID})
+          @@ -458,7 +467,7 @@
+           			},
+           		},
+           	}
+          -	resp, err := b.client.GetOrCreateConversation(req)
+          +	resp, err := b.client.GetOrCreateConversation(context.Background(), req)
+           	if err != nil {
+           		return "", err
+           	}
+          @@ -495,7 +504,7 @@
+           	}
+           
+           	// Download and decrypt.
+          -	rawBytes, err := b.client.DownloadMedia(mediaID, key)
+          +	rawBytes, err := b.downloadMedia(mediaID, key)
+           	if err != nil {
+           		return "", fmt.Errorf("DownloadMedia: %w", err)
+           	}
+          diff --git a/combined-go/mirrorbridge/bridge_avatar.go b/combined-go/mirrorbridge/bridge_avatar.go
+          --- a/combined-go/mirrorbridge/bridge_avatar.go
+          +++ b/combined-go/mirrorbridge/bridge_avatar.go
+          @@ -14,7 +14,7 @@
+           
+           // ParticipantThumbnail returns a participant's photo, or nothing when there's none.
+           func (b *Bridge) ParticipantThumbnail(participantID string) ([]byte, error) {
+          -	resp, err := b.client.GetParticipantThumbnail(participantID)
+          +	resp, err := b.client.GetParticipantThumbnail(context.Background(), participantID)
+           	if err != nil {
+           		return nil, err
+           	}
+          diff --git a/combined-go/mirrorbridge/bridge_media.go b/combined-go/mirrorbridge/bridge_media.go
+          --- a/combined-go/mirrorbridge/bridge_media.go
+          +++ b/combined-go/mirrorbridge/bridge_media.go
+          @@ -1,13 +1,24 @@
+           package mirrorbridge
+           
+          -import (
+          +import (
+          +	"context"
+           	"encoding/base64"
+          -	"fmt"
+          +	"fmt"
+          +	"io"
+           
+           	"fi.mirrormsg/mediaroute"
+           )
+           
+          -// ---- unified media entry point ---------------------------------------------
+          +func (b *Bridge) downloadMedia(mediaID string, key []byte) ([]byte, error) {
+          +	media, err := b.client.DownloadMedia(context.Background(), mediaID, key)
+          +	if err != nil {
+          +		return nil, err
+          +	}
+          +	defer media.Close()
+          +	return io.ReadAll(media)
+          +}
+          +
+          +// ---- unified media entry point ---------------------------------------------
+           //
+           // These download once and hand the bytes to mediaroute, which encodes them and
+           // wraps the reply. Only the fetch is Google-specific and lives here; every other
+          @@ -23,7 +34,7 @@
+           			return "", fmt.Errorf("bad decryptionKey base64: %w", err)
+           		}
+           	}
+          -	raw, err := b.client.DownloadMedia(mediaID, key)
+          +	raw, err := b.downloadMedia(mediaID, key)
+           	if err != nil {
+           		return "", fmt.Errorf("DownloadMedia: %w", err)
+           	}
+          diff --git a/combined-go/mirrorbridge/bridge_video.go b/combined-go/mirrorbridge/bridge_video.go
+          --- a/combined-go/mirrorbridge/bridge_video.go
+          +++ b/combined-go/mirrorbridge/bridge_video.go
+          @@ -20,7 +20,7 @@
+           			return 0, fmt.Errorf("bad decryptionKey base64: %w", err)
+           		}
+           	}
+          -	raw, err := b.client.DownloadMedia(mediaID, key)
+          +	raw, err := b.downloadMedia(mediaID, key)
+           	if err != nil {
+           		return 0, fmt.Errorf("DownloadMedia: %w", err)
+           	}
+          LIBGM_PATCH
+          gofmt -w combined-go/mirrorbridge/bridge*.go
+      - name: Rebuild native bridges
+        shell: bash
+        run: |
+          mobile_version=$(cd combined-go && go list -m -f '{{.Version}}' golang.org/x/mobile)
+          go install "golang.org/x/mobile/cmd/gomobile@$mobile_version" "golang.org/x/mobile/cmd/gobind@$mobile_version"
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          test -d "$ANDROID_NDK_HOME"
+          sh combined-go/bind.sh
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Compile Android APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --stacktrace
+      - name: Verify configuration and APK signature
+        shell: bash
+        run: |
+          build_tools=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
+          for apk in app/build/outputs/apk/debug/*.apk; do
+            "$build_tools/apksigner" verify --verbose "$apk"
+            "$build_tools/aapt" dump badging "$apk" | sed -n '/^package:/p; /^native-code:/p'
+            unzip -Z1 "$apk" | grep '^lib/arm64-v8a/libgojni\.so$'
+            sha256sum "$apk"
+          done
+      - name: Upload test APK and dependency changes
+        uses: actions/upload-artifact@v4
+        with:
+          name: MirrorMsg-pairing-fix
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            combined-go/go.mod
+            combined-go/go.sum
+          if-no-files-found: error
+
+  package-apk:
+    if: inputs.source_run_id != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      - name: Download the completed build
+        uses: actions/download-artifact@v8
+        with:
+          name: MirrorMsg-pairing-fix
+          path: build-output
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.source_run_id }}
+      - name: Extract the signed APK
+        shell: bash
+        run: |
+          cp build-output/app/build/outputs/apk/debug/app-debug.apk MirrorMsg-pairing-fix.apk
+          sha256sum MirrorMsg-pairing-fix.apk
+      - name: Upload standalone APK
+        uses: actions/upload-artifact@v7
+        with:
+          path: MirrorMsg-pairing-fix.apk
+          archive: false
+          if-no-files-found: error
+name: MirrorMsg pairing fix (test APK)
+
+on:
+  workflow_dispatch:
 
 permissions:
   contents: read
